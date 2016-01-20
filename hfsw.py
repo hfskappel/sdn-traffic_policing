@@ -8,21 +8,24 @@ from ryu.topology.api import get_switch, get_link, get_host
 from ryu.lib.packet import packet, ethernet, ipv6, vlan, ipv4, packet_base, arp
 import copy
 import networkx as nx
+from ryu.lib import stplib
 
 switch_list, links_list = [],[]
 
 
 class HFsw(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    _CONTEXTS = {'stplib': stplib.Stp}
 
     def __init__(self, *args, **kwargs):
         super(HFsw, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
         self.topology_api_app = self
         self.net=nx.DiGraph()
+        self.stp = kwargs['stplib']
 
     #Listens for incoming packets to the controller
-    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    @set_ev_cls(stplib.EventPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
         pkt = packet.Packet(msg.data)
@@ -45,32 +48,22 @@ class HFsw(app_manager.RyuApp):
                 print "Node added, src:", src, " connected to sw:", dpid, " on port: ",in_port
 
             if dst in self.net:
-                try:
-                    path=nx.shortest_path(self.net,src,dst) # get shortest path
-                    #next=path[path.index(dpid)+1] #get next hop
-                    #out_port=self.net[dpid][next]['port'] #get output port
-                    print "PATH: ", path
+                if nx.has_path(self.net,src,dst):
+                    try:
+                        path=nx.shortest_path(self.net,src,dst) # get shortest path
+                        #next=path[path.index(dpid)+1] #get next hop
+                        #out_port=self.net[dpid][next]['port'] #get output port
+                        self.install_flows(self.net, path, dp)
+                        print "PATH: ", path
 
-                except nx.NetworkXNoPath:
-                    print "No path found"
-            print dst
-            #else:
-            #    out_port = ofproto_v1_3.OFPP_FLOOD
-            #    actions = [ofp_parser.OFPActionOutput(out_port)]
-             #   out = ofp_parser.OFPPacketOut(
-             #   datapath=dp, buffer_id=msg.buffer_id, in_port=in_port,actions=actions)
-            #    dp.send_msg(out)
-
-
-
-
-
-        #ip6 = pkt.get_protocols(ipv6.ipv6)
-        #ip4 = pkt.get_protocols(ipv4.ipv4)
-        #vlans = pkt.get_protocols(vlan.vlan)
-        #print eth
-
-
+                    except nx.NetworkXNoPath:
+                        print "No path found"
+                print dst
+            else:
+                out_port = ofproto_v1_3.OFPP_FLOOD
+                actions = [ofp_parser.OFPActionOutput(out_port)]
+                out = ofp_parser.OFPPacketOut(datapath=dp, buffer_id=msg.buffer_id, in_port=in_port,actions=actions)
+                dp.send_msg(out)
 
 
     #Listens for connecting switches (ConnectionUp)
@@ -82,15 +75,20 @@ class HFsw(app_manager.RyuApp):
         links_list = get_link(self.topology_api_app, None)
         links=[(link.src.dpid,link.dst.dpid,{'port':link.src.port_no}) for link in links_list]
 
+
         #Updates graph every time we get topology data
         self.net.add_nodes_from(switches)
         self.net.add_edges_from(links)
 
         #print "Links funnet: ", links
-        #print "Switcher funnet: ", switches
+        #print "Switcher funnet: ", switches.ports
 
-        for h in ev.switch.ports:
-            print h, type(h)
+        #for h in ev.switch.ports:
+          #  print h.dpid, h.port_no
+
+        for h in switch_list:
+            for i in h.ports:
+                print i.dpid, i._config, i._state, i.name
 
         #ENDED HERE. GOING TO FIND EVERY PORT WHICH IS NOT A LINK-PORT IN ORDER TO IMPROVE ARP!
 
@@ -101,9 +99,7 @@ class HFsw(app_manager.RyuApp):
     @set_ev_cls(event.EventHostAdd)
     def get_host_data(self, ev):
         hosts_list = get_host(self.topology_api_app, None)
-
-        for h in hosts_list:
-            print h
+        print ev
 
 
 
@@ -123,6 +119,33 @@ class HFsw(app_manager.RyuApp):
 
 
 
+
+    def install_flows(self,path, dp):
+        mac_src=path[0]
+        mac_dst=path[-1]
+        out_port=self.net[dpid][next]['port'] #get output port
+        print "src: ", mac_src, " dst: ", mac_dst, " port: ", out_port
+
+        ofproto = dp.ofproto
+        parser = dp.ofproto_parser
+
+        match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
+        actions = [parser.OFPActionOutput(out_port)]
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,actions)]
+
+
+        if buffer_id:
+            mod = parser.OFPFlowMod(datapath=dp, buffer_id=buffer_id,priority=priority, match=match,instructions=inst)
+        else:
+            mod = parser.OFPFlowMod(datapath=dp, priority=priority,match=match, instructions=inst)
+
+        dp.send_msg(mod)
+
+
+
+
 #In Link-event: create a method that adds/removes detected links and adds them into links_lis
 #Iterating function to ARP without needing to broadcast
+
+#SLUTTET VED INSTALL FLOWS. SLUTTFORE DENNE
 
