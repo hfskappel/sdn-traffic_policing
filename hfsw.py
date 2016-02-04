@@ -5,13 +5,14 @@ from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.topology import event, switches
 from ryu.topology.api import get_switch, get_link, get_host
-from ryu.lib.packet import packet, ethernet, ipv6, vlan, ipv4, packet_base, arp
+from ryu.lib.packet import packet, ethernet, arp
 import copy
 import networkx as nx
 from ryu.lib import stplib
+import policy_manager
 
-switch_list, links_list = [],[]
-
+switch_list = []
+links_list = []
 
 class HFsw(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -30,36 +31,34 @@ class HFsw(app_manager.RyuApp):
         msg = ev.msg
         pkt = packet.Packet(msg.data)
         dp = msg.datapath
-        eth = pkt.get_protocols(ethernet.ethernet)[0]            #Must be added behind eth in order to execute this.
+        eth = pkt.get_protocols(ethernet.ethernet)[0]
         dpid = dp.id
         dst = eth.dst
         src = eth.src
         in_port = msg.match['in_port']
         ofp_parser = dp.ofproto_parser
-
-        #print "Source: ", src, " Dest: ", dst
-
         arp_pkt = pkt.get_protocol(arp.arp)
+
         if arp_pkt:
             if src not in self.net: #Learn it
                 self.net.add_node(src) # Add a node to the graph
                 self.net.add_edge(src,dpid) # Add a link from the node to it's edge switch
                 self.net.add_edge(dpid,src,{'port':in_port})  # Add link from switch to node and make sure you are identifying the output port.
-                print "Node added, src:", src, " connected to sw:", dpid, " on port: ",in_port
+                print "Node added to grap, Src:", src, " connected to Sw:", dpid, " on port: ",in_port
 
-            if dst in self.net:
+            if src in self.net and dst in self.net:
                 if nx.has_path(self.net,src,dst):
                     try:
                         path=nx.shortest_path(self.net,src,dst) # get shortest path
+                        self.install_flows(path, dp)
                         #next=path[path.index(dpid)+1] #get next hop
                         #out_port=self.net[dpid][next]['port'] #get output port
-                        self.install_flows(self.net, path, dp)
-                        print "PATH: ", path
 
                     except nx.NetworkXNoPath:
                         print "No path found"
-                print dst
             else:
+                #Flooding ARP packet, beacause dst is not found!
+                print "Flooding ARP!"
                 out_port = ofproto_v1_3.OFPP_FLOOD
                 actions = [ofp_parser.OFPActionOutput(out_port)]
                 out = ofp_parser.OFPPacketOut(datapath=dp, buffer_id=msg.buffer_id, in_port=in_port,actions=actions)
@@ -69,30 +68,15 @@ class HFsw(app_manager.RyuApp):
     #Listens for connecting switches (ConnectionUp)
     @set_ev_cls(event.EventSwitchEnter)
     def get_topology_data(self, ev):
-        global  switch_list, links_list
+        global switch_list, links_list
         switch_list = get_switch(self.topology_api_app, None)
         switches=[switch.dp.id for switch in switch_list]
         links_list = get_link(self.topology_api_app, None)
         links=[(link.src.dpid,link.dst.dpid,{'port':link.src.port_no}) for link in links_list]
 
-
         #Updates graph every time we get topology data
         self.net.add_nodes_from(switches)
         self.net.add_edges_from(links)
-
-        #print "Links funnet: ", links
-        #print "Switcher funnet: ", switches.ports
-
-        #for h in ev.switch.ports:
-          #  print h.dpid, h.port_no
-
-        for h in switch_list:
-            for i in h.ports:
-                print i.dpid, i._config, i._state, i.name
-
-        #ENDED HERE. GOING TO FIND EVERY PORT WHICH IS NOT A LINK-PORT IN ORDER TO IMPROVE ARP!
-
-
 
 
     #Add hosts to hosts_list, but only works at initiation
@@ -102,42 +86,109 @@ class HFsw(app_manager.RyuApp):
         print ev
 
 
-
-
     #Able to detect link changes immideatly.
     @set_ev_cls(event.EventLinkAdd)
     def _event_link_add_handler(self, ev):
         link = ev.link
-        print "Link discovered between sw:", link.src.dpid, " and sw:", link.dst.dpid, ". Total number of active links: ",len(links_list)/2
+        #print "Link discovered between sw:", link.src.dpid, " and sw:", link.dst.dpid, ". Total number of active links: ",len(links_list)/2
         #TODO: Rerouting prosedure
 
     @set_ev_cls(event.EventLinkDelete)
     def _event_link_delete_handler(self, ev):
         link = ev.link
-        print "Link disconnected between sw:", link.src.dpid, " and sw:", link.dst.dpid, ". Total number of active links: ",len(links_list)/2
+        #print "Link disconnected between sw:", link.src.dpid, " and sw:", link.dst.dpid, ". Total number of active links: ",len(links_list)/2
         #TODO: Rerouting prosedure
 
 
 
 
-    def install_flows(self,path, dp):
+    def install_flows(self, path, dp):
+        print "Install_flows executed"
         mac_src=path[0]
         mac_dst=path[-1]
-        out_port=self.net[dpid][next]['port'] #get output port
-        print "src: ", mac_src, " dst: ", mac_dst, " port: ", out_port
+
+        #Installing host rules
+        if len(path) == 2:
+            out_port = self.net[mac_dst][mac_src]['port']
+            #Mac_dst will be the switch
+            self.flow_rule(mac_src, mac_dst, out_port, mac_dst)
+
+        else:
+            #Install src
+            try:
+                out_port= self.net[path[-2]][mac_dst]['port']
+                #self.flow_rule(mac_src, mac_dst, out_port, path[-2])
+                print "From: SRC:", mac_src, "to DST:", mac_dst, " by switch: ", path[-2], " connected on port: ", out_port
+
+            except KeyError:
+                print "Error creating source flow rules"
+
+           #Install dst
+            try:
+                out_port = self.net[path[1]][mac_src]['port']
+                #self.flow_rule(mac_src, mac_dst, out_port, path[1])
+                print "From: SRC:", mac_dst, "to DST:", mac_src, " by switch: ", path[1], " connected on port: ", out_port
+
+            except KeyError:
+                print "Error creating destination flow rules"
+
+
+            #Install intermediate switch path. Removes the edges (hosts mac) from the list.
+            path = path[1:-1:1]
+
+
+            for node in range(len(path)):
+                for l in links_list:
+                    if l.src == path[node] and l.src == path[node+1]:
+                        out_port = l.src.port_no
+            print out_port
+                    #next = path[path.index(node)+1]
+
+
+                    #ENDED HERE. MAKE SURE TO ITERATE THROUGH LINKS TO FIND A PATH
+
+
+
+                   # print "DETTE DA?", links[int(path[node])][int(path[node+1])]['port']
+
+
+                    #print links[int(node)][int(node)+1]['port']
+                    #if links[int(node)][int(next)]['port'] != None:
+                        #print "Found the fucking port"
+
+                    #print "COMOOON", links[int(node)][int(path[path.index(node)+1])]['port']
+                    #if links[node][path[path.index(node)+1]]['port'] != None:
+                        #print "Port found",links[node][path[path.index(node)+1]]['port']
+
+
+                #for link in links:
+                    #if link.src.dpid == node and link.dst.dipd == path[path.index(node)+1]:
+                        #Finds the output port to send the packet
+                        #out_port=link[link.src.dpid][link.dst.dpid]['port']
+                        #self.flow_rule(mac_src, mac_dst, out_port)
+
+
+
+
+
+    def flow_rule(self,src, dst, inst, sw):
+        self.src = src
+        self.dst = dst
+        self.inst = inst
+
 
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
 
-        match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
+        match = parser.OFPMatch(eth_src=mac_src, eth_dst=mac_dst)
         actions = [parser.OFPActionOutput(out_port)]
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,actions)]
 
 
-        if buffer_id:
-            mod = parser.OFPFlowMod(datapath=dp, buffer_id=buffer_id,priority=priority, match=match,instructions=inst)
-        else:
-            mod = parser.OFPFlowMod(datapath=dp, priority=priority,match=match, instructions=inst)
+        #if buffer_id:
+            #mod = parser.OFPFlowMod(datapath=dp, buffer_id=buffer_id,priority=priority, match=match,instructions=inst)
+        #else:
+        mod = parser.OFPFlowMod(datapath=dp,match=match, instructions=inst)
 
         dp.send_msg(mod)
 
