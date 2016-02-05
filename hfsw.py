@@ -105,76 +105,40 @@ class HFsw(app_manager.RyuApp):
 
 
     def install_flows(self, path, dp):
-        print "Install_flows executed"
-        mac_src=path[0]
-        mac_dst=path[-1]
+        print "Installing flow rules in one path direction"
 
-        #Installing host rules
+        #Sorts path to install flow rules in oposite direction
+        path = path[::-1]
+        mac_src=path[-1]
+        mac_dst=path[0]
+
+        #Installing host rules when directly connected
         if len(path) == 2:
-            out_port = self.net[mac_dst][mac_src]['port']
-            #Mac_dst will be the switch
-            self.flow_rule(mac_src, mac_dst, out_port, mac_dst)
+            out_port = self.net[mac_src][mac_dst]['port']
+            #self.flow_rule(mac_src, mac_dst, out_port, mac_dst)
+            #TODO: CHECK THIS RULE
 
         else:
-            #Install src
+            #Install final destination (host to switch)
             try:
-                out_port= self.net[path[-2]][mac_dst]['port']
-                #self.flow_rule(mac_src, mac_dst, out_port, path[-2])
-                print "From: SRC:", mac_src, "to DST:", mac_dst, " by switch: ", path[-2], " connected on port: ", out_port
+                out_port= self.net[path[1]][mac_dst]['port']
+                #self.flow_rule(fill in)
+                print "To DST:", mac_dst, "go by switch: ", path[1], " and use port: ", out_port, " when SRC is: ", mac_src
 
             except KeyError:
-                print "Error creating source flow rules"
+               print "Error creating source flow rules"
 
-           #Install dst
-            try:
-                out_port = self.net[path[1]][mac_src]['port']
-                #self.flow_rule(mac_src, mac_dst, out_port, path[1])
-                print "From: SRC:", mac_dst, "to DST:", mac_src, " by switch: ", path[1], " connected on port: ", out_port
-
-            except KeyError:
-                print "Error creating destination flow rules"
-
-
-            #Install intermediate switch path. Removes the edges (hosts mac) from the list.
-            path = path[1:-1:1]
-            print path
-
+            #Install intermediate path
             for node in range(len(path)):
                 for l in links:
                     try:
-                        if node+1 < len(path) and l[0] == path[node] and l[1] == path[node+1]:
-                            print "Out_port for link found: ", l[2]['port']
+                        if node+2 < (len(path)-1) and l[0] == path[node+2] and l[1] == path[node+1]:
+                            #print "Out_port for link found: ", l[2]['port']
                             out_port = l[2]['port']
                             #self.flow_rule(mac_src, mac_dst, out_port, path[node])
-                            print "From: SRC:", mac_dst, "to DST:", mac_src, " by switch: ", path[node], " connected on port: ", out_port
+                            print "To DST:", mac_dst, "go by switch: ", path[node+2], " and use port: ", out_port, " when SRC is: ", mac_src
                     except IndexError:
                         print "Iterating function out of range"
-
-
-
-
-                    #ENDED HERE. MAKE SURE TO ITERATE THROUGH LINKS TO FIND A PATH
-
-
-
-                   # print "DETTE DA?", links[int(path[node])][int(path[node+1])]['port']
-
-
-                    #print links[int(node)][int(node)+1]['port']
-                    #if links[int(node)][int(next)]['port'] != None:
-                        #print "Found the fucking port"
-
-                    #print "COMOOON", links[int(node)][int(path[path.index(node)+1])]['port']
-                    #if links[node][path[path.index(node)+1]]['port'] != None:
-                        #print "Port found",links[node][path[path.index(node)+1]]['port']
-
-
-                #for link in links:
-                    #if link.src.dpid == node and link.dst.dipd == path[path.index(node)+1]:
-                        #Finds the output port to send the packet
-                        #out_port=link[link.src.dpid][link.dst.dpid]['port']
-                        #self.flow_rule(mac_src, mac_dst, out_port)
-
 
 
 
