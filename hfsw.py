@@ -10,9 +10,7 @@ import copy
 import networkx as nx
 from ryu.lib import stplib
 import policy_manager
-
-switch_list = []
-links_list = []
+links = []
 
 class HFsw(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -46,8 +44,8 @@ class HFsw(app_manager.RyuApp):
                 self.net.add_edge(dpid,src,{'port':in_port})  # Add link from switch to node and make sure you are identifying the output port.
                 print "Node added to grap, Src:", src, " connected to Sw:", dpid, " on port: ",in_port
 
-            if src in self.net and dst in self.net:
-                if nx.has_path(self.net,src,dst):
+            if dst in self.net:
+                if nx.has_path(self.net, src, dst):
                     try:
                         path=nx.shortest_path(self.net,src,dst) # get shortest path
                         self.install_flows(path, dp)
@@ -55,10 +53,13 @@ class HFsw(app_manager.RyuApp):
                         #out_port=self.net[dpid][next]['port'] #get output port
 
                     except nx.NetworkXNoPath:
-                        print "No path found"
+                        print "Could not create flow path"
+                else:
+                    print "No path found between ", src, " and ", dst
+
             else:
                 #Flooding ARP packet, beacause dst is not found!
-                print "Flooding ARP!"
+                print "Flooding ARP from: ",src, " to ", dst
                 out_port = ofproto_v1_3.OFPP_FLOOD
                 actions = [ofp_parser.OFPActionOutput(out_port)]
                 out = ofp_parser.OFPPacketOut(datapath=dp, buffer_id=msg.buffer_id, in_port=in_port,actions=actions)
@@ -68,7 +69,7 @@ class HFsw(app_manager.RyuApp):
     #Listens for connecting switches (ConnectionUp)
     @set_ev_cls(event.EventSwitchEnter)
     def get_topology_data(self, ev):
-        global switch_list, links_list
+        global links
         switch_list = get_switch(self.topology_api_app, None)
         switches=[switch.dp.id for switch in switch_list]
         links_list = get_link(self.topology_api_app, None)
@@ -77,6 +78,7 @@ class HFsw(app_manager.RyuApp):
         #Updates graph every time we get topology data
         self.net.add_nodes_from(switches)
         self.net.add_edges_from(links)
+        print "Switch oppdaget: ", switches
 
 
     #Add hosts to hosts_list, but only works at initiation
@@ -135,14 +137,20 @@ class HFsw(app_manager.RyuApp):
 
             #Install intermediate switch path. Removes the edges (hosts mac) from the list.
             path = path[1:-1:1]
-
+            print path
 
             for node in range(len(path)):
-                for l in links_list:
-                    if l.src == path[node] and l.src == path[node+1]:
-                        out_port = l.src.port_no
-            print out_port
-                    #next = path[path.index(node)+1]
+                for l in links:
+                    try:
+                        if node+1 < len(path) and l[0] == path[node] and l[1] == path[node+1]:
+                            print "Out_port for link found: ", l[2]['port']
+                            out_port = l[2]['port']
+                            #self.flow_rule(mac_src, mac_dst, out_port, path[node])
+                            print "From: SRC:", mac_dst, "to DST:", mac_src, " by switch: ", path[node], " connected on port: ", out_port
+                    except IndexError:
+                        print "Iterating function out of range"
+
+
 
 
                     #ENDED HERE. MAKE SURE TO ITERATE THROUGH LINKS TO FIND A PATH
