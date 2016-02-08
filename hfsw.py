@@ -8,9 +8,11 @@ from ryu.topology.api import get_switch, get_link, get_host
 from ryu.lib.packet import packet, ethernet, arp
 import copy
 import networkx as nx
-from ryu.lib import stplib
+from ryu.lib import stplib, dpid as dpid_lib
 import policy_manager
 links = []
+switch_list = []
+datapaths = {}
 
 class HFsw(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -23,14 +25,25 @@ class HFsw(app_manager.RyuApp):
         self.net=nx.DiGraph()
         self.stp = kwargs['stplib']
 
+        config = {dpid_lib.str_to_dpid('0000000000000001'):
+                {'bridge': {'priority': 0x8000}},
+            dpid_lib.str_to_dpid('0000000000000002'):
+                {'bridge': {'priority': 0x9000}},
+            dpid_lib.str_to_dpid('0000000000000003'):
+                      {'bridge': {'priority': 0xa000}}}
+        self.stp.set_config(config)
+
+
     #Listens for incoming packets to the controller
     @set_ev_cls(stplib.EventPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
+        global datapaths
         msg = ev.msg
         pkt = packet.Packet(msg.data)
         dp = msg.datapath
         eth = pkt.get_protocols(ethernet.ethernet)[0]
         dpid = dp.id
+        datapaths[dp.id] = msg.datapath
         dst = eth.dst
         src = eth.src
         in_port = msg.match['in_port']
@@ -58,18 +71,36 @@ class HFsw(app_manager.RyuApp):
                     print "No path found between ", src, " and ", dst
 
             else:
+                link_ports = []
+                for node in switch_list:
+                    for l in links:
+                        if l[0] == node.dp.id:
+                            link_ports.append(l[2]['port'])
+                            #print "link appended: ", l[2]['port']
+                    for n in node.ports:
+                        if n.port_no not in link_ports:
+                            actions = [ofp_parser.OFPActionOutput(n.port_no)]
+                            out = ofp_parser.OFPPacketOut(datapath=node.dp, buffer_id=msg.buffer_id, in_port=ofproto_v1_3.OFPP_CONTROLLER,actions=actions)
+                            node.dp.send_msg(out)
+                            print "ARP forwarded on sw: ", node.dp.id, " out port: ", n.port_no
+                    del link_ports[:]
+
+
+                    #TODO: Remove the broadcast to the port where the ARP request is sent from
+                    #TODO: FIX the broadcast. The switches dosent get the packets.!
+
                 #Flooding ARP packet, beacause dst is not found!
-                print "Flooding ARP from: ",src, " to ", dst
-                out_port = ofproto_v1_3.OFPP_FLOOD
-                actions = [ofp_parser.OFPActionOutput(out_port)]
-                out = ofp_parser.OFPPacketOut(datapath=dp, buffer_id=msg.buffer_id, in_port=in_port,actions=actions)
-                dp.send_msg(out)
+                #print "Flooding ARP from: ",src, " to ", dst
+                #out_port = ofproto_v1_3.OFPP_FLOOD
+                #actions = [ofp_parser.OFPActionOutput(out_port)]
+                #out = ofp_parser.OFPPacketOut(datapath=dp, buffer_id=msg.buffer_id, in_port=in_port,actions=actions)
+                #dp.send_msg(out)
 
 
     #Listens for connecting switches (ConnectionUp)
     @set_ev_cls(event.EventSwitchEnter)
     def get_topology_data(self, ev):
-        global links
+        global links, switch_list
         switch_list = get_switch(self.topology_api_app, None)
         switches=[switch.dp.id for switch in switch_list]
         links_list = get_link(self.topology_api_app, None)
@@ -115,15 +146,15 @@ class HFsw(app_manager.RyuApp):
         #Installing host rules when directly connected
         if len(path) == 2:
             out_port = self.net[mac_src][mac_dst]['port']
-            #self.flow_rule(mac_src, mac_dst, out_port, mac_dst)
+            self.flow_rule(mac_src, mac_dst, out_port, mac_src)
             #TODO: CHECK THIS RULE
 
         else:
             #Install final destination (host to switch)
             try:
                 out_port= self.net[path[1]][mac_dst]['port']
-                #self.flow_rule(fill in)
-                print "To DST:", mac_dst, "go by switch: ", path[1], " and use port: ", out_port, " when SRC is: ", mac_src
+                self.flow_rule(mac_src, mac_dst, out_port, path[1])
+                #print "To DST:", mac_dst, "go by switch: ", path[1], " and use port: ", out_port, " when SRC is: ", mac_src
 
             except KeyError:
                print "Error creating source flow rules"
@@ -133,42 +164,29 @@ class HFsw(app_manager.RyuApp):
                 for l in links:
                     try:
                         if node+2 < (len(path)-1) and l[0] == path[node+2] and l[1] == path[node+1]:
-                            #print "Out_port for link found: ", l[2]['port']
                             out_port = l[2]['port']
-                            #self.flow_rule(mac_src, mac_dst, out_port, path[node])
-                            print "To DST:", mac_dst, "go by switch: ", path[node+2], " and use port: ", out_port, " when SRC is: ", mac_src
+                            self.flow_rule(mac_src, mac_dst, out_port, path[node+2])
+                            #print "To DST:", mac_dst, "go by switch: ", path[node+2], " and use port: ", out_port, " when SRC is: ", mac_src
                     except IndexError:
                         print "Iterating function out of range"
 
 
 
 
-    def flow_rule(self,src, dst, inst, sw):
+    def flow_rule(self,src, dst, out_port, sw):
+        print "Installing rule on :", sw, "Match conditions: eth_src =  ", src, " and eth_dst = ", dst, ". Action: out_port =  ", out_port
         self.src = src
         self.dst = dst
-        self.inst = inst
+        self.out_port = out_port
+        self.sw = sw
 
-
-        ofproto = dp.ofproto
-        parser = dp.ofproto_parser
-
-        match = parser.OFPMatch(eth_src=mac_src, eth_dst=mac_dst)
-        actions = [parser.OFPActionOutput(out_port)]
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,actions)]
-
-
-        #if buffer_id:
-            #mod = parser.OFPFlowMod(datapath=dp, buffer_id=buffer_id,priority=priority, match=match,instructions=inst)
-        #else:
-        mod = parser.OFPFlowMod(datapath=dp,match=match, instructions=inst)
-
-        dp.send_msg(mod)
-
-
-
-
-#In Link-event: create a method that adds/removes detected links and adds them into links_lis
-#Iterating function to ARP without needing to broadcast
-
-#SLUTTET VED INSTALL FLOWS. SLUTTFORE DENNE
+        for node in switch_list:
+            if node.dp.id == sw:
+                dp = datapaths.get(node.dp.id)
+                ofp_parser = dp.ofproto_parser
+                actions = [ofp_parser.OFPActionOutput(port=out_port)]
+                match = dp.ofproto_parser.OFPMatch(eth_src=src, eth_dst=dst)
+                inst = [ofp_parser.OFPInstructionActions(ofproto_v1_3.OFPIT_APPLY_ACTIONS, actions)]
+                mod = dp.ofproto_parser.OFPFlowMod(datapath=dp, match=match, cookie=0,command=ofproto_v1_3.OFPFC_ADD, idle_timeout=0, hard_timeout=0,priority=ofproto_v1_3.OFP_DEFAULT_PRIORITY, instructions=inst)
+                dp.send_msg(mod)
 
