@@ -1,27 +1,31 @@
-#One class for group policies due to every policiy needs it? OR just a general policy?
-#What about switch spesific policies?
-#Longest prefix = highest priority
-#Each policy has a priority. If its 0 (lowest), then the pri is based on the match criterions (longest prefix)
 import networkx as nx
+from ryu.lib.packet import ethernet, ipv4, vlan
 policy_list = []
 action_list = []
 
-class Policy():
+class Policy(object):
 
-    # In a user-interface, this will be listed
-    def match(self, protocol= 0, ip_src = 0, ip_dst= 0, mask = 0, tos = 0,
-    eth_src = 0, eth_dst=0, eth_type=0, vlan=0, all = False):
+    def __init__(self):
+        self.match_list = {}
+        self.actions_list = {}
 
-        self.protocol = protocol
-        self.ip_src = ip_src
-        self.ip_dst = ip_dst
-        self.mask = mask
-        self.tos = tos
-        self.eth_src = eth_src
-        self.eth_dst = eth_dst
-        self.eth_type = eth_type
-        self.vlan = vlan
-        self.all = all  #General/wildcard policies
+    def match(self, protocol=0, ip_src=0, ip_dst= 0,tos=0,
+    eth_src=0, eth_dst=0, vlan=0, eth_type=0, all=False):
+
+        self.match_list = {
+            'protocol': protocol,
+            'ip_src': ip_src,
+            'ip_dst': ip_dst,
+            'tos': tos,
+            'eth_src': eth_src,
+            'eth_dst': eth_dst,
+            'vlan': vlan,
+            'eth_type': eth_type,
+            'all': all
+        }
+
+    def get_matches(self):
+        return self.match_list
 
     def priority(self, priority=0):
         self.priority=priority
@@ -29,103 +33,134 @@ class Policy():
     def get_priority(self):
         return self.priority
 
-    def action(self, limitation=False, nodes=False, resource_allocation=False, random=False, block=False):
-        self.limitation = limitation
-        self.nodes = nodes
-        self.resource_allocation = resource_allocation
-        self.random = random
-        self.block = block
-        #Some policies are pushed down to router level, but can by applied by linking the route to the group table?
+    def action(self, idle_timeout=0, hard_timeout=0, random=False, block=False, bandwidth_requirement=0, load_balance=False):
 
-    def get_action(self):
-        #Return actions which is true
-        if self.limitation != 0 or self.limitation:
-            return self.limitation
+            self.actions_list = {
+            'idle_timeout': idle_timeout,
+            'hard_timeout': hard_timeout,
+            'random': random,
+            'block': block,
+            'bandwidth_requirement': bandwidth_requirement,
+            'load_balance': load_balance
+            }
 
-        if self.nodes != 0 or self.nodes:
-            return self.nodes
-
-        if self.resource_allocation != 0 or self.resource_allocation:
-            return self.resource_allocation
-
-        if self.random != 0 or self.random:
-            return self.random
-
-        if self.block != 0 or self.block:
-            return self.block
+    def get_actions(self):
+        return self.actions_list
 
 
-def policy_sorter():#ev):
-    ev = 1337
-    #Dekomponere ev to get properties from the packet
+
+#Function that finds the associated policies
+def policy_finder(packet, policy_list):
+    eth = packet.get_protocols(ethernet.ethernet)[0]
+    ip = packet.get_protocols(ipv4.ipv4)
+    vl = packet.get_protocols(vlan.vlan)
+    eth_dst = eth.dst
+    eth_src = eth.src
+    eth_type = 1337    #eth.type
+    ip_dst = 1337       #ip.dst
+    ip_src = 1337       #ip.src
+    tos = 1337           #ip.tos
+    proto = 1337        #ip.proto
+    vlanid = 1337       #vl.vid
 
     for policy in policy_list:
-        priority = 0
+        policy_check=[policy.get_matches()]
+        for p in policy_check:
+            total_matches = 0
+            actual_matches = 0
+            for key, value in p.iteritems():
+                #Filters out unset parameters
+                if value != 0 or value is True:
+                    total_matches = total_matches+1
+                    #print key, value
+                    #print total_matches
 
-        #Getting all general policies.
-        if policy.all:
-            action_list.append(policy)
+                    if key == "protocol" and value == proto:
+                        actual_matches = actual_matches+1
 
-        if policy.protocol==ev:
-            priority = priority+1
+                    if key == "ip_dst" and value == ip_dst:
+                        actual_matches = actual_matches+1
 
-        if policy.ip_src == ev:
-            priority = priority+1
+                    if key == "ip_src" and value == ip_src:
+                        actual_matches = actual_matches+1
 
-        if policy.ip_dst ==ev:
-            priority = priority+1
+                    if key == "tos" and value == tos:
+                        actual_matches = actual_matches+1
 
-        if policy.mask == ev:
-            priority = priority+1
+                    if key == "eth_src" and value == eth_src:
+                        actual_matches = actual_matches+1
 
-        if policy.tos ==ev:
-            priority = priority+1
+                    if key == "eth_dst" and value == eth_dst:
+                        actual_matches = actual_matches+1
 
-        if policy.eth_src == ev:
-            priority = priority+1
+                    if key == "vlan" and value == vlanid:
+                        actual_matches = actual_matches+1
 
-        if policy.eth_dst == ev:
-            priority = priority+1
+                    if key == "eth_type" and value == eth_type:
+                        actual_matches = actual_matches+1
 
-        if policy.eth_type == ev:
-            priority = priority+1
+            #Ensures that all policy criterions are matched with parameters from the packet
+            if actual_matches == total_matches:
+                print "Found policy!"
 
-        if policy.vlan == ev:
-            priority = priority+1
+                #Ensures that 20 is the lowest possible priority.
+                if policy.get_priority() > 20:
+                    #policy.priority(20-actual_matches)
+                    print "Priority: ", policy.get_priority()
 
-        #If priority is bigger than 0, then a match is found. Checks the policies priority
-        if priority != 0:
-            if priority > policy.get_priority():
-                policy.priority(priority)
-            action_list.append(policy)
+                #If priority is lower than matches on the prefix, adjust priority. If higher; assume admin wants it high.
+                if actual_matches < policy.get_priority():
+                    #policy.priority(20-actual_matches)
+                    print "Priority: ", policy.get_priority()
+
+                #Action list represents all the policies which are to be executed
+                action_list.append(policy)
+
 
     #Sorts the list based on the priority. Highest priority first!
-    action_list.sort(key=lambda x: x.priority, reverse=True)
+    action_list.sort(key=lambda x: x.priority, reverse=False)
 
-    for action in action_list:
-        #INSERT SORT FUNCTION!
-        print action.get_action()
-
+    #Returns a list of matched and sorted policies
+    return action_list
 
 
-def policy_enforce(action_list):#packetIN):
-    #Function is used to execute the actions in the policies
+
+
+
+
+#Function that checks the policies against the topology and excisting rules
+def policy_checker(action_list):#packetIN):
+    capasity = 0
+    random = 0
+
+    #Flow-based priorities
     for policy in action_list:
-        if policy.get_action == "Random":
-            print "OFP_Hard-timeout = 180"
-            print "Generate path"
+        if policy.block:print "blocked"
+            #OFP_action = Drop
+        if policy.hard_timeout != 0:print "hard timeout"
+            #OFP_hard_timeout == policy.hard_timeout
+        if policy.idle_timeout != 0:print "idle timeout"
+            #OFP_hard_timeout == policy.idle_timeout
+        if policy.vlan != 0: print "vlan"
+            #OFP_vlan = policy.vlan
 
-        if policy.get_action == "Block":
-            print "OFP_OUT-port = None"
 
-        #Idle timeout
-        #Hard timeout
-        #Priority
-        #Instructions: GoToTable og WriteActions( Output, Push/POP VLAN, SetQueue), Apply actions, Clear actions.
-        #GoToTable is used for more processing
+    #Group-based priorities
+        #Where all is true, perhaps?
 
-    #OSV..
-    # Need to solve how we can apply and add flow rules into group rules
+
+
+    #Routing-based priorities
+
+        if capasity == 0:
+            capasity = policy.bandwidth
+
+        if random == False:
+            random =policy.random
+
+    #Generate path
+    path_calculation(random,capasity)
+
 
 
 
@@ -156,7 +191,7 @@ def path_calculation(random=False, capasity = 0):
                     return path
             else:
                 #If no path with capabilities found, return false!
-                print "No path found"
+                print "No path found which matches capacity need: ", capasity
                 return False
 
 
@@ -167,35 +202,6 @@ def network_capasity(path, capasity):
 
 
 
-
-
-
-
-
-    #Execute each policy
-    #Adds new policies if there are more. (IF end of policy do..
-    #If mismatch; discard policies with low priority
-    #Deletes actions -list
-    #A policiy with highest priority needs longest prefix match as flow rules
-
-
-
-
-pelle = Policy()
-pelle.match(ip_dst=1337)
-pelle.action(nodes=2)
-pelle.priority(2)
-policy_list.append(pelle)
-
-pello = Policy()
-pello.match(ip_src=1337)
-pello.action(nodes=555)
-pello.priority(100)
-policy_list.append(pello)
-
-policy_sorter()
-policy_enforce(action_list)
-
 #1. Iterate through reactive policies
 #2. Add policies to a action list
 #3. Sort by priority (longest prefix or fixed pri is highest)
@@ -205,3 +211,15 @@ policy_enforce(action_list)
 # Flow rules should be passed through group tables if there are policies at switch/proactive level
 
 #OFP_MOD_OUT-PORT=Generate_port()
+# Need to solve how we can apply and add flow rules into group rules
+
+#
+    #Execute each policy
+    #Adds new policies if there are more. (IF end of policy do..
+    #If mismatch; discard policies with low priority
+    #Deletes actions -list
+    #A policiy with highest priority needs longest prefix match as flow rules
+
+#TODO: Get IP and VLAN properties
+#TODO: Why dosent policy.priority(20-actual_match) work
+#TODO: Test it!
