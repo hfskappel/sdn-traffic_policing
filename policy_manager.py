@@ -1,5 +1,5 @@
 import networkx as nx
-from ryu.lib.packet import ethernet, ipv4, vlan
+from ryu.lib.packet import ethernet, ipv4, vlan, ipv6, arp
 policy_list = []
 action_list = []
 
@@ -9,17 +9,15 @@ class Policy(object):
         self.match_list = {}
         self.actions_list = {}
 
-    def match(self, protocol=0, ip_src=0, ip_dst= 0,tos=0,
-    eth_src=0, eth_dst=0, vlan=0, eth_type=0, all=False):
+    def match(self, protocol=0, ip_src=0, ip_dst= 0,
+    eth_src=0, eth_dst=0, eth_type=0, all=False):
 
         self.match_list = {
             'protocol': protocol,
             'ip_src': ip_src,
             'ip_dst': ip_dst,
-            'tos': tos,
             'eth_src': eth_src,
             'eth_dst': eth_dst,
-            'vlan': vlan,
             'eth_type': eth_type,
             'all': all
         }
@@ -33,12 +31,12 @@ class Policy(object):
     def get_priority(self):
         return self.priority
 
-    def action(self, idle_timeout=0, hard_timeout=0, random=False, block=False, bandwidth_requirement=0, load_balance=False):
+    def action(self, idle_timeout=0, hard_timeout=0, random_routing=False, block=False, bandwidth_requirement=0, load_balance=False):
 
             self.actions_list = {
             'idle_timeout': idle_timeout,
             'hard_timeout': hard_timeout,
-            'random': random,
+            'random_routing': random_routing,
             'block': block,
             'bandwidth_requirement': bandwidth_requirement,
             'load_balance': load_balance
@@ -48,20 +46,37 @@ class Policy(object):
         return self.actions_list
 
 
+    def print_policy(self):
+
+        printlist = ["Condition(s)"]
+
+        for key, value in self.match_list.iteritems():
+
+            if value != 0 or value is True:
+                printlist.extend((key,value))
+
+        printlist.append("Action(s): ")
+        for key, value in self.actions_list.iteritems():
+            if value != 0 or value is True:
+                printlist.extend((key,value))
+
+        return printlist
+
+
 
 #Function that finds the associated policies
 def policy_finder(packet, policy_list):
     eth = packet.get_protocols(ethernet.ethernet)[0]
-    ip = packet.get_protocols(ipv4.ipv4)
+    ip = packet.get_protocols(arp.arp)[0]
+    ip4 = packet.get_protocols(ipv4.ipv4)
     vl = packet.get_protocols(vlan.vlan)
     eth_dst = eth.dst
     eth_src = eth.src
-    eth_type = 1337    #eth.type
-    ip_dst = 1337       #ip.dst
-    ip_src = 1337       #ip.src
-    tos = 1337           #ip.tos
-    proto = 1337        #ip.proto
-    vlanid = 1337       #vl.vid
+    eth_type = eth.ethertype
+    ip_dst = ip.dst_ip
+    ip_src = ip.src_ip
+    proto = ip.proto
+
 
     for policy in policy_list:
         policy_check=[policy.get_matches()]
@@ -72,8 +87,7 @@ def policy_finder(packet, policy_list):
                 #Filters out unset parameters
                 if value != 0 or value is True:
                     total_matches = total_matches+1
-                    #print key, value
-                    #print total_matches
+
 
                     if key == "protocol" and value == proto:
                         actual_matches = actual_matches+1
@@ -84,16 +98,10 @@ def policy_finder(packet, policy_list):
                     if key == "ip_src" and value == ip_src:
                         actual_matches = actual_matches+1
 
-                    if key == "tos" and value == tos:
-                        actual_matches = actual_matches+1
-
                     if key == "eth_src" and value == eth_src:
                         actual_matches = actual_matches+1
 
                     if key == "eth_dst" and value == eth_dst:
-                        actual_matches = actual_matches+1
-
-                    if key == "vlan" and value == vlanid:
                         actual_matches = actual_matches+1
 
                     if key == "eth_type" and value == eth_type:
@@ -101,21 +109,18 @@ def policy_finder(packet, policy_list):
 
             #Ensures that all policy criterions are matched with parameters from the packet
             if actual_matches == total_matches:
-                print "Found policy!"
 
                 #Ensures that 20 is the lowest possible priority.
                 if policy.get_priority() > 20:
-                    #policy.priority(20-actual_matches)
-                    print "Priority: ", policy.get_priority()
+                    policy.priority = 20
 
-                #If priority is lower than matches on the prefix, adjust priority. If higher; assume admin wants it high.
-                if actual_matches < policy.get_priority():
-                    #policy.priority(20-actual_matches)
-                    print "Priority: ", policy.get_priority()
+                #If no priority is specified, use longest prefix to determine the priority.
+                if policy.get_priority() == 0 or type(policy.get_priority()) is not 'int':
+                    policy.priority = 10 - actual_matches
 
                 #Action list represents all the policies which are to be executed
                 action_list.append(policy)
-
+                print "Found policy: ", policy.print_policy(), " with priority ", policy.get_priority()
 
     #Sorts the list based on the priority. Highest priority first!
     action_list.sort(key=lambda x: x.priority, reverse=False)
@@ -164,7 +169,6 @@ def policy_checker(action_list):#packetIN):
 
 
 
-
 def path_calculation(random=False, capasity = 0):
     if random:
         #Find the shortest path to the destination
@@ -194,32 +198,13 @@ def path_calculation(random=False, capasity = 0):
                 print "No path found which matches capacity need: ", capasity
                 return False
 
-
-
 def network_capasity(path, capasity):
     #Insert function to get link status from network
     return True
 
 
 
-#1. Iterate through reactive policies
-#2. Add policies to a action list
-#3. Sort by priority (longest prefix or fixed pri is highest)
-#4. Gather network information
-#4. Executes the actions according to the order and network status
-#5 Create flow rules based on the parameters given
-# Flow rules should be passed through group tables if there are policies at switch/proactive level
 
-#OFP_MOD_OUT-PORT=Generate_port()
-# Need to solve how we can apply and add flow rules into group rules
-
+#TODO: Create Network_checker() and Running_policy_checker()
+#TODO: Pass the returned list from policy_finder to network_checker
 #
-    #Execute each policy
-    #Adds new policies if there are more. (IF end of policy do..
-    #If mismatch; discard policies with low priority
-    #Deletes actions -list
-    #A policiy with highest priority needs longest prefix match as flow rules
-
-#TODO: Get IP and VLAN properties
-#TODO: Why dosent policy.priority(20-actual_match) work
-#TODO: Test it!
