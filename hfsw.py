@@ -43,7 +43,7 @@ class HFsw(app_manager.RyuApp):
         arp_pkt = pkt.get_protocol(arp.arp)
 
         if arp_pkt:
-            print "ARP request received at sw:",dpid
+            #print "ARP request received at sw:",dpid
             if src not in self.net: #Learn it
                 self.net.add_node(src) # Add a node to the graph
                 self.net.add_edge(src,dpid) # Add a link from the node to it's edge switch
