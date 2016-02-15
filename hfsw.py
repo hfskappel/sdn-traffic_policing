@@ -8,10 +8,18 @@ from ryu.lib.packet import packet, ethernet, arp, ipv4
 import networkx as nx
 import policy_manager
 from policy_inputs import generate_policies
+from ryu.lib import hub
+from operator import attrgetter
+from collections import defaultdict
 
 links = []
 switch_list = []
 links_list = []
+sleeptime = 10
+
+port_errors = defaultdict(lambda:defaultdict(lambda:None))
+rx_bytes = defaultdict(lambda:defaultdict(lambda:None))
+tx_bytes = defaultdict(lambda:defaultdict(lambda:None))
 
 
 class HFsw(app_manager.RyuApp):
@@ -22,6 +30,8 @@ class HFsw(app_manager.RyuApp):
         self.mac_to_port = {}
         self.topology_api_app = self
         self.net=nx.DiGraph()
+        self.monitor_thread = hub.spawn(self._network_monitor)
+
         #Executes the policies at initiation
         #generate_policies()
         global policy_list
@@ -55,9 +65,11 @@ class HFsw(app_manager.RyuApp):
                     try:
                         #Find policies
                         policy_manager.policy_finder(pkt, policy_list)
+                        self.network_checker(src, dst, "lol")
                         #Gets the shortest path
-                        path=nx.shortest_path(self.net,src,dst)
-                        self.install_flows(path)
+                        #path=nx.shortest_path(self.net,src,dst)
+
+                        #self.install_flows(path)
 
                     except nx.NetworkXNoPath:
                         print "Could not create flow path"
@@ -108,6 +120,7 @@ class HFsw(app_manager.RyuApp):
         print "Link oppdaget", links
 
 
+
     #Add hosts to hosts_list, but only works at initiation
     @set_ev_cls(event.EventHostAdd)
     def get_host_data(self, ev):
@@ -138,7 +151,76 @@ class HFsw(app_manager.RyuApp):
         #TODO: Rerouting prosedure
 
 
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def _flow_stats_reply_handler(self, ev):
+        body = ev.msg.body
 
+        self.logger.info('datapath         '
+                         'in-port  eth-dst           '
+                         'out-port packets  bytes')
+        self.logger.info('---------------- '
+                         '-------- ----------------- '
+                         '-------- -------- --------')
+        for stat in sorted([flow for flow in body if flow.priority == 1],
+                           key=lambda flow: (flow.match['in_port'],
+                                             flow.match['eth_dst'])):
+            self.logger.info('%016x %8x %17s %8x %8d %8d',
+                             ev.msg.datapath.id,
+                             stat.match['in_port'], stat.match['eth_dst'],
+                             stat.instructions[0].actions[0].port,
+                             stat.packet_count, stat.byte_count)
+
+
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def _port_stats_reply_handler(self, ev):
+        body = ev.msg.body
+
+        for stat in sorted(body, key=attrgetter('port_no')):
+            port_errors[ev.msg.datapath.id][stat.port_no]= stat.rx_bytes+stat.tx_bytes
+
+            if rx_bytes[ev.msg.datapath.id][stat.port_no] is None:
+                rx_bytes[ev.msg.datapath.id][stat.port_no] = stat.rx_bytes
+
+            receiving_traffic = 8.0*float(stat.rx_bytes - rx_bytes[ev.msg.datapath.id][stat.port_no])/1000.0
+            rx_bytes[ev.msg.datapath.id][stat.port_no] = stat.rx_bytes
+
+            if tx_bytes[ev.msg.datapath.id][stat.port_no] is None:
+                tx_bytes[ev.msg.datapath.id][stat.port_no] = stat.tx_bytes
+
+            transmitting_traffic = 8.0*float(stat.tx_bytes - tx_bytes[ev.msg.datapath.id][stat.port_no])/1000.0
+            tx_bytes[ev.msg.datapath.id][stat.port_no] = stat.tx_bytes
+
+            print "Transmitting ", transmitting_traffic, "kb/s at switch: ", ev.msg.datapath.id
+            print "Receiving ", receiving_traffic, "kb/s at switch: ", ev.msg.datapath.id
+
+
+
+
+    @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
+    def port_desc_stats_reply_handler(self, ev):
+        #self.logger.info('OFPPortDescStatsReply received: \n')
+        """
+        Port description reply message
+        The switch responds with this message to a port description request.
+        Attribute   |    Description
+        ------------|---------------
+        body        |    List of OFPPortDescStats instance
+        """
+        for p in ev.msg.body:
+            print("\t port_no=%d hw_addr=%s name=%s config=0x%08x "
+                             "\n \t state=0x%08x curr=0x%08x advertised=0x%08x "
+                             "\n \t supported=0x%08x peer=0x%08x curr_speed=%d "
+                             "max_speed=%d" %
+                             (p.port_no, p.hw_addr,
+                              p.name, p.config,
+                              p.state, p.curr, p.advertised,
+                              p.supported, p.peer, p.curr_speed,
+                              p.max_speed))
+
+
+
+
+################ CUSTOM FUNCTIONS ######################################################################################
 
     def install_flows(self, path):
         print "Installing flow rules in one path direction"
@@ -168,7 +250,38 @@ class HFsw(app_manager.RyuApp):
 
 
 
+    #Iterates through network data and checks if network parameters is accepted by the policy.
+    def network_checker(self, src, dst, policies):
+        possible_paths=nx.all_shortest_paths(self.net,src,dst)
 
+        for p in possible_paths:
+            out_port= self.net[p[1]][p[0]]['port']
+            print "Network Checker: Port: ", out_port, " Node", p[1]
+            for node in range(len(p)):
+                for l in links:
+                    try:
+                        if node+2 < (len(p)-1) and l[0] == p[node+2] and l[1] == p[node+1]:
+                            out_port = l[2]['port']
+                            print "Network Checker: Port: ", out_port, " Node ", p[node+2]
+                    except IndexError:
+                        print "Iterating function out of range"
+
+
+
+
+    def _network_monitor(self):
+        while True:
+            for node in switch_list:
+                self.send_stats_request(node.dp)
+            hub.sleep(sleeptime)
+
+
+
+
+
+
+
+################ OPENFLOW MESSAGE FUNCTIONS ############################################################################
 
     #Function to send a flow rule to a switch
     def send_flow_rule(self,src, dst, out_port, sw):
@@ -186,8 +299,6 @@ class HFsw(app_manager.RyuApp):
                 inst = [ofp_parser.OFPInstructionActions(ofproto_v1_3.OFPIT_APPLY_ACTIONS, actions)]
                 mod = node.dp.ofproto_parser.OFPFlowMod(datapath=node.dp, match=match, cookie=0,command=ofproto_v1_3.OFPFC_ADD, idle_timeout=0, hard_timeout=0,priority=ofproto_v1_3.OFP_DEFAULT_PRIORITY, instructions=inst)
                 node.dp.send_msg(mod)
-
-
 
 
     #Function to group rule to a switch
@@ -213,6 +324,30 @@ class HFsw(app_manager.RyuApp):
                 node.dp.send_msg(req)
 
 
+    def send_stats_request(self,datapath):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        #Sends a Flow Stats Request
+        #req = parser.OFPFlowStatsRequest(datapath)
+        #datapath.send_msg(req)
+
+        #Sends a Port_Stats_Request
+        #req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
+        #datapath.send_msg(req)
+
+        #req = parser.OFPGroupStatsRequest(datapath,0, ofproto.OFPG_ALL,None)
+        #datapath.send_msg(req)
+
+        req = parser.OFPPortDescStatsRequest(datapath, 0)
+        datapath.send_msg(req)
+        print "sent to, ", datapath
+
+
+
+
+
+
 
 
 
@@ -231,7 +366,3 @@ class HFsw(app_manager.RyuApp):
 #TODO: Is it possible to add more actions to the flow rules. Look at how we can send a flow through multiple group tables
 # http://csie.nqu.edu.tw/smallko/sdn/ryu_multipath_13.htm
 #http://ryu-zhdoc.readthedocs.org/en/latest/ofproto_v1_3_ref.html
-#
-#
-#
-#
