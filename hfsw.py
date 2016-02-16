@@ -15,12 +15,14 @@ from collections import defaultdict
 links = []
 switch_list = []
 links_list = []
-sleeptime = 10
-
+sleeptime = 5
+bandwidth_limit = 10
 port_errors = defaultdict(lambda:defaultdict(lambda:None))
-rx_bytes = defaultdict(lambda:defaultdict(lambda:None))
-tx_bytes = defaultdict(lambda:defaultdict(lambda:None))
-
+port_status = defaultdict(lambda:defaultdict(lambda:None))
+old_src_tx_bytes = defaultdict(lambda:defaultdict(lambda:None))
+old_src_rx_bytes = defaultdict(lambda:defaultdict(lambda:None))
+old_dst_tx_bytes = defaultdict(lambda:defaultdict(lambda:None))
+old_dst_rx_bytes = defaultdict(lambda:defaultdict(lambda:None))
 
 class HFsw(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -31,11 +33,13 @@ class HFsw(app_manager.RyuApp):
         self.topology_api_app = self
         self.net=nx.DiGraph()
         self.monitor_thread = hub.spawn(self._network_monitor)
+        self.new_flow_stats = 0
 
         #Executes the policies at initiation
         #generate_policies()
         global policy_list
         policy_list=generate_policies()
+
 
 
     #Listens for incoming packets to the controller
@@ -67,9 +71,8 @@ class HFsw(app_manager.RyuApp):
                         policy_manager.policy_finder(pkt, policy_list)
                         self.network_checker(src, dst, "lol")
                         #Gets the shortest path
-                        #path=nx.shortest_path(self.net,src,dst)
-
-                        #self.install_flows(path)
+                        path=nx.shortest_path(self.net,src,dst)
+                        self.install_flows(path)
 
                     except nx.NetworkXNoPath:
                         print "Could not create flow path"
@@ -151,19 +154,13 @@ class HFsw(app_manager.RyuApp):
         #TODO: Rerouting prosedure
 
 
+
+
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply_handler(self, ev):
         body = ev.msg.body
 
-        self.logger.info('datapath         '
-                         'in-port  eth-dst           '
-                         'out-port packets  bytes')
-        self.logger.info('---------------- '
-                         '-------- ----------------- '
-                         '-------- -------- --------')
-        for stat in sorted([flow for flow in body if flow.priority == 1],
-                           key=lambda flow: (flow.match['in_port'],
-                                             flow.match['eth_dst'])):
+        for stat in sorted([flow for flow in body if flow.priority == 1],key=lambda flow: (flow.match['in_port'],flow.match['eth_dst'])):
             self.logger.info('%016x %8x %17s %8x %8d %8d',
                              ev.msg.datapath.id,
                              stat.match['in_port'], stat.match['eth_dst'],
@@ -171,27 +168,13 @@ class HFsw(app_manager.RyuApp):
                              stat.packet_count, stat.byte_count)
 
 
+
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def _port_stats_reply_handler(self, ev):
-        body = ev.msg.body
 
-        for stat in sorted(body, key=attrgetter('port_no')):
-            port_errors[ev.msg.datapath.id][stat.port_no]= stat.rx_bytes+stat.tx_bytes
-
-            if rx_bytes[ev.msg.datapath.id][stat.port_no] is None:
-                rx_bytes[ev.msg.datapath.id][stat.port_no] = stat.rx_bytes
-
-            receiving_traffic = 8.0*float(stat.rx_bytes - rx_bytes[ev.msg.datapath.id][stat.port_no])/1000.0
-            rx_bytes[ev.msg.datapath.id][stat.port_no] = stat.rx_bytes
-
-            if tx_bytes[ev.msg.datapath.id][stat.port_no] is None:
-                tx_bytes[ev.msg.datapath.id][stat.port_no] = stat.tx_bytes
-
-            transmitting_traffic = 8.0*float(stat.tx_bytes - tx_bytes[ev.msg.datapath.id][stat.port_no])/1000.0
-            tx_bytes[ev.msg.datapath.id][stat.port_no] = stat.tx_bytes
-
-            print "Transmitting ", transmitting_traffic, "kb/s at switch: ", ev.msg.datapath.id
-            print "Receiving ", receiving_traffic, "kb/s at switch: ", ev.msg.datapath.id
+        #Adding the port information to a global list
+        global port_status
+        port_status[ev.msg.datapath.id] = ev.msg.body
 
 
 
@@ -267,21 +250,71 @@ class HFsw(app_manager.RyuApp):
                         print "Iterating function out of range"
 
 
-
-
     def _network_monitor(self):
         while True:
             for node in switch_list:
                 self.send_stats_request(node.dp)
+
+            for link in links_list:
+                self.check_link(link, True, True)
+
             hub.sleep(sleeptime)
 
 
+    #Iterating function to inspect a given link for packet loss and transmitting traffic
+    def check_link(self, link, measure_loss, measure_bandwidth):
+        global old_dst_tx_bytes, old_src_tx_bytes, old_src_tx_bytes, old_src_tx_bytes
+        src_tx_bytes = 0
+        dst_tx_bytes = 0
+        src_rx_bytes = 0
+        dst_rx_bytes = 0
+
+        for stat in port_status[link.src.dpid]:
+            if link.src.port_no == stat.port_no:
+                src_rx_bytes = stat.rx_bytes
+                src_tx_bytes = stat.tx_bytes
+
+        for stat in port_status[link.dst.dpid]:
+            if link.dst.port_no == stat.port_no:
+                dst_rx_bytes = stat.rx_bytes
+                dst_tx_bytes = stat.tx_bytes
+
+        if old_src_tx_bytes[link.src.dpid][link.src.port_no] is None and old_dst_tx_bytes[link.dst.dpid][link.dst.port_no] \
+                is None and old_src_rx_bytes[link.src.dpid][link.src.port_no] is None and old_dst_rx_bytes[link.dst.dpid][link.dst.port_no] is None:
+            old_src_rx_bytes[link.src.dpid][link.src.port_no] = src_rx_bytes
+            old_src_tx_bytes[link.src.dpid][link.src.port_no] = src_tx_bytes
+            old_dst_rx_bytes[link.dst.dpid][link.dst.port_no] = dst_rx_bytes
+            old_dst_tx_bytes[link.dst.dpid][link.dst.port_no] = dst_tx_bytes
+
+        pathloss = abs(((old_src_tx_bytes[link.src.dpid][link.src.port_no]+old_src_rx_bytes[link.src.dpid][link.src.port_no]) - \
+                   (old_dst_tx_bytes[link.dst.dpid][link.dst.port_no]+old_dst_rx_bytes[link.dst.dpid][link.dst.port_no])) - \
+                   ((src_rx_bytes+src_tx_bytes)-(dst_rx_bytes+dst_tx_bytes)))
+
+        old_traffic = (old_src_tx_bytes[link.src.dpid][link.src.port_no]+old_src_rx_bytes[link.src.dpid][link.src.port_no]+ \
+                       old_dst_tx_bytes[link.dst.dpid][link.dst.port_no] + old_dst_rx_bytes[link.dst.dpid][link.dst.port_no])
+        traffic = abs((8*float(old_traffic - (src_tx_bytes+src_rx_bytes+dst_tx_bytes+dst_rx_bytes))/4/1000000)/sleeptime)
+
+        old_src_tx_bytes[link.src.dpid][link.src.port_no] = src_tx_bytes
+        old_src_rx_bytes[link.src.dpid][link.src.port_no] = src_rx_bytes
+        old_dst_tx_bytes[link.dst.dpid][link.dst.port_no] = dst_tx_bytes
+        old_dst_rx_bytes[link.dst.dpid][link.dst.port_no] = dst_rx_bytes
 
 
+        if measure_bandwidth and measure_loss:
+            print traffic, " mbit/s and with packet loss of ", pathloss, "the last ", sleeptime, "seconds at link:", link.src.dpid, " - ", link.dst.dpid
+            return pathloss, traffic
 
+        elif measure_loss:
+            print pathloss, "bytes lost the last ", sleeptime, "  seconds at link ", link.src.dpid, " - ", link.dst.dpid
+            return pathloss
+
+        elif measure_bandwidth:
+            print traffic, " mbit/s at link:", link.src.dpid, " - ", link.dst.dpid
+            return traffic
 
 
 ################ OPENFLOW MESSAGE FUNCTIONS ############################################################################
+
 
     #Function to send a flow rule to a switch
     def send_flow_rule(self,src, dst, out_port, sw):
@@ -301,7 +334,7 @@ class HFsw(app_manager.RyuApp):
                 node.dp.send_msg(mod)
 
 
-    #Function to group rule to a switch
+    #Function to send a group rule to a switch
     def send_group_rule(self, src, dst, sw):
         self.src = src
         self.dst = dst
@@ -324,6 +357,7 @@ class HFsw(app_manager.RyuApp):
                 node.dp.send_msg(req)
 
 
+    #Function to send a stats request to a switch
     def send_stats_request(self,datapath):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
@@ -333,30 +367,15 @@ class HFsw(app_manager.RyuApp):
         #datapath.send_msg(req)
 
         #Sends a Port_Stats_Request
-        #req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
-        #datapath.send_msg(req)
+        req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
+        datapath.send_msg(req)
 
         #req = parser.OFPGroupStatsRequest(datapath,0, ofproto.OFPG_ALL,None)
         #datapath.send_msg(req)
 
-        req = parser.OFPPortDescStatsRequest(datapath, 0)
-        datapath.send_msg(req)
-        print "sent to, ", datapath
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+       # req = parser.OFPPortDescStatsRequest(datapath, 0)
+        #datapath.send_msg(req)
+        #print "sent to, ", datapath
 
 
 
