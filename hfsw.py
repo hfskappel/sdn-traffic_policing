@@ -36,10 +36,8 @@ class HFsw(app_manager.RyuApp):
         self.new_flow_stats = 0
 
         #Executes the policies at initiation
-        #generate_policies()
         global policy_list
         policy_list=generate_policies()
-
 
 
     #Listens for incoming packets to the controller
@@ -57,7 +55,6 @@ class HFsw(app_manager.RyuApp):
         arp_pkt = pkt.get_protocol(arp.arp)
 
         if arp_pkt:
-            #print "ARP request received at sw:",dpid
             if src not in self.net: #Learn it
                 self.net.add_node(src) # Add a node to the graph
                 self.net.add_edge(src,dpid) # Add a link from the node to it's edge switch
@@ -68,8 +65,8 @@ class HFsw(app_manager.RyuApp):
                 if nx.has_path(self.net, src, dst):
                     try:
                         #Find policies
-                        policy_manager.policy_finder(pkt, policy_list)
-                        self.network_checker(src, dst, "lol")
+                        policy_match = policy_manager.policy_finder(pkt, policy_list)
+                        self.network_checker(src, dst, policy_match)
                         #Gets the shortest path
                         path=nx.shortest_path(self.net,src,dst)
                         self.install_flows(path)
@@ -102,8 +99,6 @@ class HFsw(app_manager.RyuApp):
                                     out = ofp_parser.OFPPacketOut(datapath=node.dp, buffer_id=0xffffffff, in_port=in_port, actions=actions, data=msg.data)
                                     node.dp.send_msg(out)
                                     print "ARP forwarded on sw:", node.dp.id, " out port: ", n.port_no
-
-
 
 
 
@@ -178,31 +173,6 @@ class HFsw(app_manager.RyuApp):
 
 
 
-
-    @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
-    def port_desc_stats_reply_handler(self, ev):
-        #self.logger.info('OFPPortDescStatsReply received: \n')
-        """
-        Port description reply message
-        The switch responds with this message to a port description request.
-        Attribute   |    Description
-        ------------|---------------
-        body        |    List of OFPPortDescStats instance
-        """
-        for p in ev.msg.body:
-            print("\t port_no=%d hw_addr=%s name=%s config=0x%08x "
-                             "\n \t state=0x%08x curr=0x%08x advertised=0x%08x "
-                             "\n \t supported=0x%08x peer=0x%08x curr_speed=%d "
-                             "max_speed=%d" %
-                             (p.port_no, p.hw_addr,
-                              p.name, p.config,
-                              p.state, p.curr, p.advertised,
-                              p.supported, p.peer, p.curr_speed,
-                              p.max_speed))
-
-
-
-
 ################ CUSTOM FUNCTIONS ######################################################################################
 
     def install_flows(self, path):
@@ -223,10 +193,10 @@ class HFsw(app_manager.RyuApp):
 
             #Install intermediate path
         for node in range(len(path)):
-            for l in links:
+            for l in links_list:
                 try:
-                    if node+2 < (len(path)-1) and l[0] == path[node+2] and l[1] == path[node+1]:
-                        out_port = l[2]['port']
+                    if node+2 < (len(path)-1) and l.src.dpid == path[node+2] and l.dst.dpid == path[node+1]:
+                        out_port = l.src.port_no
                         self.send_flow_rule(mac_src, mac_dst, out_port, path[node+2])
                 except IndexError:
                     print "Iterating function out of range"
@@ -234,30 +204,69 @@ class HFsw(app_manager.RyuApp):
 
 
     #Iterates through network data and checks if network parameters is accepted by the policy.
-    def network_checker(self, src, dst, policies):
+    def network_checker(self, src, dst, policy_match):
+        sorted_actions = []
+        for policy in policy_match:
+            #Fetches the sorted policies
+            actions = [policy.get_actions()]
+            for action in actions:
+                for key, value in action.iteritems():
+                    if value != 0 or value is True:
+                        if key == "idle_timeout":
+                            print "Policy_action", key, value
+                            sorted_actions.extend((key, value, policy.get_priority()))
+
+                        if key == "hard_timeout":
+                            print "Policy_action", key, value
+                            sorted_actions.extend((key, value, policy.get_priority()))
+
+                        if key == "random_routing":
+                            possible_paths=nx.all_shortest_paths(self.net,src,dst)
+                            sorted_actions.extend((key, value, policy.get_priority()))
+
+                        if key == "block":
+                            print "Policy_action", key, value
+                            sorted_actions.extend((key, value, policy.get_priority()))
+
+                        if key == "bandwidth_requirement":
+                            print "Policy_action", key, value
+                            sorted_actions.extend((key, value, policy.get_priority()))
+
+                        if key == "load_balance":
+                            print "Policy_action", key, value
+                            sorted_actions.extend((key, value, policy.get_priority()))
+
+        print "Sorted actions", sorted_actions
         possible_paths=nx.all_shortest_paths(self.net,src,dst)
 
+    #Random pick function at the end if random_routing is present.
+    #The bandwidth function filters out possible links to use.
+    #
+
+    #Crawls a full path. List as input
+    def path_crawler(self, possible_paths):
+        #Path crawler
         for p in possible_paths:
-            out_port= self.net[p[1]][p[0]]['port']
-            print "Network Checker: Port: ", out_port, " Node", p[1]
+            out_port = self.net[p[1]][p[0]]['port']
             for node in range(len(p)):
-                for l in links:
+                for l in links_list:
                     try:
-                        if node+2 < (len(p)-1) and l[0] == p[node+2] and l[1] == p[node+1]:
-                            out_port = l[2]['port']
-                            print "Network Checker: Port: ", out_port, " Node ", p[node+2]
+                        if node+2 < (len(p)-1) and l.src.dpid == p[node+2] and l.dst.dpid == p[node+1]:
+                            print "Network Checker: Links used:", l.src.dpid, "-", l.dst.dpid
+                            print "Flowing traffic:", self.check_link(l, False, True)
+                            print "Dropped packets:", self.check_link(l, True, False)
+
                     except IndexError:
                         print "Iterating function out of range"
+
 
 
     def _network_monitor(self):
         while True:
             for node in switch_list:
                 self.send_stats_request(node.dp)
-
             for link in links_list:
                 self.check_link(link, True, True)
-
             hub.sleep(sleeptime)
 
 
@@ -301,15 +310,15 @@ class HFsw(app_manager.RyuApp):
 
 
         if measure_bandwidth and measure_loss:
-            print traffic, " mbit/s and with packet loss of ", pathloss, "the last ", sleeptime, "seconds at link:", link.src.dpid, " - ", link.dst.dpid
+            #print traffic, " mbit/s and with packet loss of ", pathloss, "the last ", sleeptime, "seconds at link:", link.src.dpid, "-", link.dst.dpid
             return pathloss, traffic
 
         elif measure_loss:
-            print pathloss, "bytes lost the last ", sleeptime, "  seconds at link ", link.src.dpid, " - ", link.dst.dpid
+            #print pathloss, "bytes lost the last ", sleeptime, "  seconds at link ", link.src.dpid, " - ", link.dst.dpid
             return pathloss
 
         elif measure_bandwidth:
-            print traffic, " mbit/s at link:", link.src.dpid, " - ", link.dst.dpid
+            #print traffic, " mbit/s at link:", link.src.dpid, " - ", link.dst.dpid
             return traffic
 
 
@@ -323,6 +332,8 @@ class HFsw(app_manager.RyuApp):
         self.dst = dst
         self.out_port = out_port
         self.sw = sw
+
+            #TODO: FUNCTION TO GET PARAMETERS FROM POLICY
 
         for node in switch_list:
             if node.dp.id == sw:
@@ -357,31 +368,21 @@ class HFsw(app_manager.RyuApp):
                 node.dp.send_msg(req)
 
 
-    #Function to send a stats request to a switch
+    #Function to send a stats requests to a switch
     def send_stats_request(self,datapath):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
         #Sends a Flow Stats Request
-        #req = parser.OFPFlowStatsRequest(datapath)
-        #datapath.send_msg(req)
+        req = parser.OFPFlowStatsRequest(datapath)
+        datapath.send_msg(req)
 
         #Sends a Port_Stats_Request
         req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
         datapath.send_msg(req)
 
-        #req = parser.OFPGroupStatsRequest(datapath,0, ofproto.OFPG_ALL,None)
-        #datapath.send_msg(req)
-
-       # req = parser.OFPPortDescStatsRequest(datapath, 0)
-        #datapath.send_msg(req)
-        #print "sent to, ", datapath
+        #Sends a Group_Stats_Request
+        req = parser.OFPGroupStatsRequest(datapath,0, ofproto.OFPG_ALL,None)
+        datapath.send_msg(req)
 
 
-
-
-#TODO: Check why it is so slow. Due to loss at ARP reply?
-#TODO: Add group_mod function and test it
-#TODO: Is it possible to add more actions to the flow rules. Look at how we can send a flow through multiple group tables
-# http://csie.nqu.edu.tw/smallko/sdn/ryu_multipath_13.htm
-#http://ryu-zhdoc.readthedocs.org/en/latest/ofproto_v1_3_ref.html
