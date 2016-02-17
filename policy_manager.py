@@ -68,14 +68,13 @@ class Policy(object):
 def policy_finder(packet, policy_list):
     eth = packet.get_protocols(ethernet.ethernet)[0]
     ip = packet.get_protocols(arp.arp)[0]
-    ip4 = packet.get_protocols(ipv4.ipv4)
-    vl = packet.get_protocols(vlan.vlan)
     eth_dst = eth.dst
     eth_src = eth.src
     eth_type = eth.ethertype
     ip_dst = ip.dst_ip
     ip_src = ip.src_ip
     proto = ip.proto
+    del action_list[:]
 
 
     for policy in policy_list:
@@ -87,7 +86,6 @@ def policy_finder(packet, policy_list):
                 #Filters out unset parameters
                 if value != 0 or value is True:
                     total_matches = total_matches+1
-
 
                     if key == "protocol" and value == proto:
                         actual_matches = actual_matches+1
@@ -115,7 +113,7 @@ def policy_finder(packet, policy_list):
                     policy.priority = 20
 
                 #If no priority is specified, use longest prefix to determine the priority.
-                if policy.get_priority() == 0 or type(policy.get_priority()) is not 'int':
+                if policy.get_priority() == 0 or isinstance(policy.get_priority(), int) is False:
                     policy.priority = 10 - actual_matches
 
                 #Action list represents all the policies which are to be executed
@@ -127,7 +125,6 @@ def policy_finder(packet, policy_list):
 
     #Returns a list of matched and sorted policies
     return action_list
-
 
 
 
