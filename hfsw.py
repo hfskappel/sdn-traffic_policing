@@ -11,13 +11,14 @@ from policy_inputs import generate_policies
 from ryu.lib import hub
 from operator import attrgetter
 from collections import defaultdict
+import random
 
 links = []
 switch_list = []
 links_list = []
+running_policies = []
 sleeptime = 5
-bandwidth_limit = 10
-port_errors = defaultdict(lambda:defaultdict(lambda:None))
+bandwidth_limit = 1
 port_status = defaultdict(lambda:defaultdict(lambda:None))
 old_src_tx_bytes = defaultdict(lambda:defaultdict(lambda:None))
 old_src_rx_bytes = defaultdict(lambda:defaultdict(lambda:None))
@@ -32,6 +33,7 @@ class HFsw(app_manager.RyuApp):
         self.mac_to_port = {}
         self.topology_api_app = self
         self.net=nx.DiGraph()
+        #self.path=nx.DiGraph()
         self.monitor_thread = hub.spawn(self._network_monitor)
         self.new_flow_stats = 0
 
@@ -64,9 +66,11 @@ class HFsw(app_manager.RyuApp):
             if dst in self.net:
                 if nx.has_path(self.net, src, dst):
                     try:
-                        #Find policies
+                        #Finds policies
                         policy_match = policy_manager.policy_finder(pkt, policy_list)
+                        running_policies.append(policy_match)
                         self.network_checker(src, dst, policy_match)
+
                         #Gets the shortest path
                         path=nx.shortest_path(self.net,src,dst)
                         self.install_flows(path)
@@ -123,7 +127,7 @@ class HFsw(app_manager.RyuApp):
     @set_ev_cls(event.EventHostAdd)
     def get_host_data(self, ev):
         hosts_list = get_host(self.topology_api_app, None)
-        print ev
+        #print ev
 
 
     #Detects new links
@@ -197,7 +201,7 @@ class HFsw(app_manager.RyuApp):
                 try:
                     if node+2 < (len(path)-1) and l.src.dpid == path[node+2] and l.dst.dpid == path[node+1]:
                         out_port = l.src.port_no
-                        self.send_flow_rule(mac_src, mac_dst, out_port, path[node+2])
+                        self.send_flow_rule(mac_src, mac_dst, out_port,path[node+2])
                 except IndexError:
                     print "Iterating function out of range"
 
@@ -206,6 +210,9 @@ class HFsw(app_manager.RyuApp):
     #Iterates through network data and checks if network parameters is accepted by the policy.
     def network_checker(self, src, dst, policy_match):
         sorted_actions = []
+        flow_rule_policies = []
+        possible_paths = []
+
         for policy in policy_match:
             #Fetches the sorted policies
             actions = [policy.get_actions()]
@@ -214,37 +221,73 @@ class HFsw(app_manager.RyuApp):
                     if value != 0 or value is True:
                         if key == "idle_timeout":
                             print "Policy_action", key, value
-                            sorted_actions.extend((key, value, policy.get_priority()))
+                            flow_rule_policies.extend((key, value))
 
                         if key == "hard_timeout":
                             print "Policy_action", key, value
-                            sorted_actions.extend((key, value, policy.get_priority()))
-
-                        if key == "random_routing":
-                            possible_paths=nx.all_shortest_paths(self.net,src,dst)
-                            sorted_actions.extend((key, value, policy.get_priority()))
+                            flow_rule_policies.extend((key, value))
 
                         if key == "block":
                             print "Policy_action", key, value
-                            sorted_actions.extend((key, value, policy.get_priority()))
+                            flow_rule_policies.extend((key, value))
 
-                        if key == "bandwidth_requirement":
+                        if key == "random_routing":
                             print "Policy_action", key, value
-                            sorted_actions.extend((key, value, policy.get_priority()))
 
                         if key == "load_balance":
                             print "Policy_action", key, value
                             sorted_actions.extend((key, value, policy.get_priority()))
+                        #TODO: Check if its possible to spread the traffic to allow the bandwidth to
 
-        print "Sorted actions", sorted_actions
-        possible_paths=nx.all_shortest_paths(self.net,src,dst)
 
-    #Random pick function at the end if random_routing is present.
-    #The bandwidth function filters out possible links to use.
-    #
+                        if key == "bandwidth_requirement":
+                            print "Policy_action", key, value
 
-    #Crawls a full path. List as input
-    def path_crawler(self, possible_paths):
+                            #Gets the possible paths in the network
+                            possible_paths = nx.all_shortest_paths(self.net,src,dst)
+
+                            # Filters out the bad links
+                            bad_links = self.path_crawler(possible_paths,value)
+                            #Does not seem to work
+                            path = self.net
+
+                            for l in bad_links:
+                                try:
+                                    path.remove_edge(l.src.dpid, l.dst.dpid)
+                                    path.remove_edge(l.dst.dpid, l.src.dpid)
+                                except nx.NetworkXError:
+                                    print "Link is already deleted"
+
+                            #Tries to find a path among the filtred links
+                            if nx.has_path(path, src, dst):
+                                #If a path is available, take the shortest path.
+                                possible_paths = nx.shortest_path(path,src,dst)
+                                print "Found a suitable path"
+
+                            else:
+                                print "Traffic load"
+                                #TODO: Traffic load crawler
+
+
+                                print "Policy crawler, no paths found"
+
+                                #Adding the bad links back
+                                for l in bad_links:
+                                    try:
+                                        self.net.add_edge(l.src.dpid, l.dst.dpid)
+                                        self.net.add_edge(l.dst.dpid, l.src.dpid)
+
+                                    except nx.NetworkXError:
+                                        print "Link is already added"
+
+                                #Function that checks excisting flow rules and priorities
+                                #Check running policies
+
+
+
+    #Crawls a full path. List of paths as input, denied links output
+    def path_crawler(self, possible_paths, limit):
+        bad = []
         #Path crawler
         for p in possible_paths:
             out_port = self.net[p[1]][p[0]]['port']
@@ -252,12 +295,54 @@ class HFsw(app_manager.RyuApp):
                 for l in links_list:
                     try:
                         if node+2 < (len(p)-1) and l.src.dpid == p[node+2] and l.dst.dpid == p[node+1]:
-                            print "Network Checker: Links used:", l.src.dpid, "-", l.dst.dpid
-                            print "Flowing traffic:", self.check_link(l, False, True)
-                            print "Dropped packets:", self.check_link(l, True, False)
+                            flowing = self.check_link(l, False, True)
+                            #print "Ongoing traffic on link ",l.src.dpid, "-", l.dst.dpid, ": ", flowing
+
+                            if bandwidth_limit - flowing < limit:
+                                print "Error! Ongoing traffic on link is ", flowing, " max bandwidth is ", bandwidth_limit, " while policy needs ", limit
+                                bad.append(l)
 
                     except IndexError:
                         print "Iterating function out of range"
+        return bad
+
+
+
+    #Checks policy_lists for key value, based on priority
+    def policy_crawler(self, policy_list, key, value, priority):
+        movable_policies = []
+        move = 0
+        for p in policy_list:
+            if p.priority < priority:
+                #Sorts and add policies with lower priority
+                movable_policies.append(p)
+
+        #Sorts from low to high
+        sorted(movable_policies, key=priority, reverse=False)
+        for m in movable_policies:
+            print "Sorted policy because policy checker is run" , m
+            move = self.policy_action_fetcher(m, "bandwidth_requirement")
+
+            if move != 0:
+                print "Found a policy to move"
+
+
+        #Todo: Find a match on a policy. (Doesent need to be a  Move and run process all over. Move until the path is cleared.
+        # Challenge: We dont know what path the policy has taken
+        # Challenge: Policies without specified bandwidth needs; how much traffic is transmitted here?
+        # Challenge: Flows can have multiple policies added to it.
+
+
+
+    #Returns the action value
+    def policy_action_fetcher(self, policy, condition):
+        actions = [policy.get_actions()]
+        for action in actions:
+            for key, value in action.iteritems():
+                if value != 0 or value is True:
+                    if key == condition:
+                        return value
+
 
 
 
@@ -265,8 +350,8 @@ class HFsw(app_manager.RyuApp):
         while True:
             for node in switch_list:
                 self.send_stats_request(node.dp)
-            for link in links_list:
-                self.check_link(link, True, True)
+            #for link in links_list:
+                #self.check_link(link, True, True)
             hub.sleep(sleeptime)
 
 
@@ -333,7 +418,8 @@ class HFsw(app_manager.RyuApp):
         self.out_port = out_port
         self.sw = sw
 
-            #TODO: FUNCTION TO GET PARAMETERS FROM POLICY
+            #TODO: FUNCTION TO GET PARAMETERS FROM flow_rule_policies[]
+            #TODO: PRIORITY PARAMETER MUST BE SET
 
         for node in switch_list:
             if node.dp.id == sw:
@@ -386,3 +472,4 @@ class HFsw(app_manager.RyuApp):
         datapath.send_msg(req)
 
 
+#TODO: Define a function to find the most possible matches and print to console.
