@@ -14,6 +14,7 @@ from collections import defaultdict
 import random
 
 links = []
+limited_links = []
 switch_list = []
 links_list = []
 running_policies = []
@@ -24,6 +25,7 @@ old_src_tx_bytes = defaultdict(lambda:defaultdict(lambda:None))
 old_src_rx_bytes = defaultdict(lambda:defaultdict(lambda:None))
 old_dst_tx_bytes = defaultdict(lambda:defaultdict(lambda:None))
 old_dst_rx_bytes = defaultdict(lambda:defaultdict(lambda:None))
+
 
 class HFsw(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -212,6 +214,7 @@ class HFsw(app_manager.RyuApp):
         sorted_actions = []
         flow_rule_policies = []
         possible_paths = []
+        traffic_load = []
 
         for policy in policy_match:
             #Fetches the sorted policies
@@ -237,7 +240,6 @@ class HFsw(app_manager.RyuApp):
                         if key == "load_balance":
                             print "Policy_action", key, value
                             sorted_actions.extend((key, value, policy.get_priority()))
-                        #TODO: Check if its possible to spread the traffic to allow the bandwidth to
 
 
                         if key == "bandwidth_requirement":
@@ -248,41 +250,63 @@ class HFsw(app_manager.RyuApp):
 
                             # Filters out the bad links
                             bad_links = self.path_crawler(possible_paths,value)
-                            #Does not seem to work
-                            path = self.net
 
                             for l in bad_links:
                                 try:
-                                    path.remove_edge(l.src.dpid, l.dst.dpid)
-                                    path.remove_edge(l.dst.dpid, l.src.dpid)
+                                    self.net.remove_edge(l.src.dpid, l.dst.dpid)
+                                    self.net.remove_edge(l.dst.dpid, l.src.dpid)
                                 except nx.NetworkXError:
                                     print "Link is already deleted"
 
                             #Tries to find a path among the filtred links
-                            if nx.has_path(path, src, dst):
+                            if nx.has_path(self.net, src, dst):
                                 #If a path is available, take the shortest path.
-                                possible_paths = nx.shortest_path(path,src,dst)
+                                possible_paths = nx.shortest_path(self.net,src,dst)
                                 print "Found a suitable path"
 
-                            else:
-                                print "Traffic load"
-                                #TODO: Traffic load crawler
+                                #Adds the bad links back in top routing pool
+                            for l in bad_links:
+                                try:
+                                    self.net.add_edge(l.src.dpid, l.dst.dpid)
+                                    self.net.add_edge(l.dst.dpid, l.src.dpid)
+                                except nx.NetworkXError:
+                                    print "Link is already added"
+
+                            else: #If no paths is found
+                                print "Traffic load is needed"
+                                traffic_load_paths = []
+
+                                #Iterate through path to find the weakest link
+                                possible_paths = nx.all_shortest_paths(self.net, src, dst)
+
+                                for p in possible_paths:
+                                   # print "Possible path:", p
+                                    link_bandwidth = 999
+                                    for nodes in range(len(p)-1):
+                                        #If a link in the path is weak, fetch the weakest link.
+                                        for link in limited_links:
+                                            if p[nodes] == link[1].src.dpid and p[nodes+1] == link[1].dst.dpid:
+                                                print p[nodes], link[1].src.dpid, p[nodes+1], link[1].dst.dpid
+                                                if link_bandwidth > link[0]:
+                                                    link_bandwidth = link[0]
+                                                    print "KLUNG"
+
+                                    #If possible traffic load path found:
+                                    traffic_load_paths.append([p, link_bandwidth])
+                                    for nodez in range(len(p)-1):
+                                        for chosen in limited_links:
+                                            if p[nodez] == chosen[1].src.dpid and p[nodez+1] == chosen[1].dst.dpid:
+                                                chosen[0] = chosen[0]-link_bandwidth
+                                    value = value - link_bandwidth
+                                    print "value", value, " link[0]", link[0]
+
+                                    if value <= 0:
+                                        for p in traffic_load_paths:
+                                            print "Bandwidth limit achieved, using ", p
+                                        break
 
 
-                                print "Policy crawler, no paths found"
-
-                                #Adding the bad links back
-                                for l in bad_links:
-                                    try:
-                                        self.net.add_edge(l.src.dpid, l.dst.dpid)
-                                        self.net.add_edge(l.dst.dpid, l.src.dpid)
-
-                                    except nx.NetworkXError:
-                                        print "Link is already added"
-
-                                #Function that checks excisting flow rules and priorities
-                                #Check running policies
-
+                            #TODO: Traffic load function must be fixed! Something is not right.
 
 
     #Crawls a full path. List of paths as input, denied links output
@@ -301,10 +325,16 @@ class HFsw(app_manager.RyuApp):
                             if bandwidth_limit - flowing < limit:
                                 print "Error! Ongoing traffic on link is ", flowing, " max bandwidth is ", bandwidth_limit, " while policy needs ", limit
                                 bad.append(l)
+                                limited_links.append([bandwidth_limit-flowing, l])
 
                     except IndexError:
                         print "Iterating function out of range"
         return bad
+
+
+
+
+
 
 
 
@@ -325,6 +355,29 @@ class HFsw(app_manager.RyuApp):
 
             if move != 0:
                 print "Found a policy to move"
+
+
+    #Iterate through flow tables to find flows using a specified path. Then lookup to find its policy.
+    def flow_rule_crawler(self):
+        for sw in switch_list:
+            print "lol"
+
+            #if event.link.dpid1 == sw.connection.dpid:
+                #sw.connection.send(of.ofp_flow_mod(command=of.OFPFC_DELETE,out_port=event.link.port1))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
         #Todo: Find a match on a policy. (Doesent need to be a  Move and run process all over. Move until the path is cleared.
