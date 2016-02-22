@@ -129,75 +129,10 @@ def policy_finder(packet, policy_list):
 
 
 
-
 #Function that checks the policies against the topology and excisting rules
-def policy_checker(action_list):#packetIN):
-    capasity = 0
-    random = 0
-
-    #Flow-based priorities
-    for policy in action_list:
-        if policy.block:print "blocked"
-            #OFP_action = Drop
-        if policy.hard_timeout != 0:print "hard timeout"
-            #OFP_hard_timeout == policy.hard_timeout
-        if policy.idle_timeout != 0:print "idle timeout"
-            #OFP_hard_timeout == policy.idle_timeout
-        if policy.vlan != 0: print "vlan"
-            #OFP_vlan = policy.vlan
-
-
-    #Group-based priorities
-        #Where all is true, perhaps?
 
 
 
-    #Routing-based priorities
-
-        if capasity == 0:
-            capasity = policy.bandwidth
-
-        if random == False:
-            random =policy.random
-
-    #Generate path
-    path_calculation(random,capasity)
-
-
-
-
-def path_calculation(random=False, capasity = 0):
-    if random:
-        #Find the shortest path to the destination
-        path = nx.shortest_path
-
-    else:
-        #Pick a random path to the destination
-        path = random.sample(nx.all_shortest_paths,1)
-
-
-    if capasity == 0:
-        #If no capasity needs, choose the path
-        return path
-
-    if capasity != 0:
-        #If the flow has capasity needs; check the path for its needs
-        if network_capasity(path, capasity):
-            return path
-        else:
-            #Iterate through paths until a suitable path is found
-            path = nx.all_shortest_paths()
-            for p in path:
-                if network_capasity(path, capasity):
-                    return path
-            else:
-                #If no path with capabilities found, return false!
-                print "No path found which matches capacity need: ", capasity
-                return False
-
-def network_capasity(path, capasity):
-    #Insert function to get link status from network
-    return True
 
 
 
