@@ -123,10 +123,22 @@ class HFsw(app_manager.RyuApp):
         self.net.add_nodes_from(switches)
         #self.net.add_edges_from(links)
 
+        #Installs rules to forward arp requests to the controller.
+        for switch in switch_list:
+            ofp_parser = switch.dp.ofproto_parser
+            actions = [ofp_parser.OFPActionOutput(ofproto_v1_3.OFPP_CONTROLLER)]
+            match = switch.dp.ofproto_parser.OFPMatch(ofproto_v1_3.OFPR_NO_MATCH)
+            inst = [ofp_parser.OFPInstructionActions(ofproto_v1_3.OFPIT_APPLY_ACTIONS, actions)]
+            mod = switch.dp.ofproto_parser.OFPFlowMod(datapath=switch.dp, match=match, cookie=0,command=ofproto_v1_3.OFPFC_ADD, idle_timeout=0, hard_timeout=0,priority=0, instructions=inst)
+            switch.dp.send_msg(mod)
+
+
+
+
         #Generating random link speeds, for simulation purposes
         hub.sleep(0.1)
         for link in links_list:
-            linkspeed = random.randint(1,1)
+            linkspeed = random.randint(1,9)
             if link_bandwidths[link.src.dpid][link.src.port_no] is None and link_bandwidths[link.dst.dpid][link.dst.port_no] is None:
                 link_bandwidths[link.src.dpid][link.src.port_no] = linkspeed
                 link_bandwidths[link.dst.dpid][link.dst.port_no] = linkspeed
@@ -138,7 +150,6 @@ class HFsw(app_manager.RyuApp):
     @set_ev_cls(event.EventHostAdd)
     def get_host_data(self, ev):
         hosts_list = get_host(self.topology_api_app, None)
-        #print ev
 
 
     #Detects new links
@@ -168,12 +179,16 @@ class HFsw(app_manager.RyuApp):
     def _flow_stats_reply_handler(self, ev):
         body = ev.msg.body
 
-        for stat in sorted([flow for flow in body if flow.priority == 1],key=lambda flow: (flow.match['in_port'],flow.match['eth_dst'])):
-            self.logger.info('%016x %8x %17s %8x %8d %8d',
-                             ev.msg.datapath.id,
-                             stat.match['in_port'], stat.match['eth_dst'],
-                             stat.instructions[0].actions[0].port,
-                             stat.packet_count, stat.byte_count)
+        try:
+            for stat in sorted([flow for flow in body if flow.priority == 1],key=lambda flow: (flow.match['in_port'],flow.match['eth_dst'])):
+                self.logger.info('%016x %8x %17s %8x %8d %8d',
+                ev.msg.datapath.id,
+                stat.match['in_port'], stat.match['eth_dst'],
+                stat.instructions[0].actions[0].port,
+                stat.packet_count, stat.byte_count)
+
+        except KeyError:
+            print "Error gitt"
 
 
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
@@ -201,21 +216,15 @@ class HFsw(app_manager.RyuApp):
             else:
                 #If paths are found, but traffic loading is needed. flow = [path, bandwidth, value]
                 #Iterates over the first path and compairs all the other paths with it
+                group_rules_created = []
                 for first in flow:
                     for f in range(len(first[0])-1):
                         group_rule = []
                         for second in flow:
                             port1 = 0
                             for s in range(len(second[0])-1):
-                                if first[0][f] == second[0][s] and first[0][f+1] != second[0][s+1]:
-                                    print "FOUND IT", first[1],first[2], second[1], second[2]
-
-                                    #TODO: ENDED HERE! Group rule installatin in both directions, but the outcome is not the same. FIX
-                                    #Bandwidth limit achieved, using  [['92:4b:c4:26:57:72', 2, 1, 3, '4a:d5:70:aa:d9:01'], 1, 2]
-                                    #Bandwidth limit achieved, using  [['92:4b:c4:26:57:72', 2, 4, 3, '4a:d5:70:aa:d9:01'], 1, 1]
-                                    #FOUND IT 1 2 1 1
-
-
+                                #Checks for multiple paths, and that a group rule is not created on the node allready.
+                                if first[0][f] == second[0][s] and first[0][f+1] != second[0][s+1] and first[0][f] not in group_rules_created:
 
                                     if port1 == 0:
                                         port1 = self.find_out_port(first[0][f], first[0][f+1])
@@ -243,12 +252,24 @@ class HFsw(app_manager.RyuApp):
                             #Creates a flowrule linking to the group rule
                             self.send_flow_rule(src,dst,group_id, first[0][f], "group")
 
+                            #Saves the group_rule to a list, to prevent creating two copies
+                            group_rules_created.append(first[0][f])
+
                         else:
                             #Send a flow rule to that switch (ensure its not to the clients)
-                            if first[0][f] != first[0][0] and first[0][f+1] != first[0][-1]:
+                            if first[0][f] != first[0][0] and first[0][f+1] != first[0][-1] and first[0][f] not in group_rules_created:
+                                #print "FIRST", first[0]
+                                #Finds the next port
                                 port = self.find_out_port(first[0][f], first[0][f+1])
 
+                                #Installs flow rule to the switch
                                 self.send_flow_rule(src, dst, port, first[0][f], "port")
+
+                            elif first[0][f+1] == first[0][-1]:
+                                port = self.net[first[0][f]][first[0][f+1]]['port']
+                                self.send_flow_rule(src, dst, port, first[0][f], "port")
+
+
 
 
         else:
@@ -605,11 +626,6 @@ class HFsw(app_manager.RyuApp):
 
 
 
-    def check_flow(self):
-        print "LOL"
-
-
-
 ################ OPENFLOW MESSAGE FUNCTIONS ############################################################################
 
 
@@ -630,9 +646,9 @@ class HFsw(app_manager.RyuApp):
                     actions = [ofp_parser.OFPActionGroup(out_port)]
                 match = node.dp.ofproto_parser.OFPMatch(eth_src=src, eth_dst=dst)
                 inst = [ofp_parser.OFPInstructionActions(ofproto_v1_3.OFPIT_APPLY_ACTIONS, actions)]
-                mod = node.dp.ofproto_parser.OFPFlowMod(datapath=node.dp, match=match, cookie=0,command=ofproto_v1_3.OFPFC_ADD, idle_timeout=0, hard_timeout=0,priority=ofproto_v1_3.OFP_DEFAULT_PRIORITY, instructions=inst)
+                mod = node.dp.ofproto_parser.OFPFlowMod(datapath=node.dp, match=match, cookie=0,command=ofproto_v1_3.OFPFC_ADD, idle_timeout=0, hard_timeout=0,priority=2, instructions=inst)
                 node.dp.send_msg(mod)
-
+    #ofproto_v1_3.OFP_DEFAULT_PRIORITY
 
     #Function to send a group rule to a switch based on a list with ports and weights
     def send_group_rule(self, src, dst, sw, port_weight_list, group_id):
@@ -651,14 +667,15 @@ class HFsw(app_manager.RyuApp):
                     weight = pw[1]
                     queue = ofp_parser.OFPActionSetQueue(0)
                     actions = [queue, ofp_parser.OFPActionOutput(port)]
-                    watch_port = 0
-                    watch_group = 0
+                    watch_port = ofproto_v1_3.OFPP_ANY
+                    watch_group = ofproto_v1_3.OFPQ_ALL
                     buckets.extend([ofp_parser.OFPBucket(weight, watch_port, watch_group, actions)])
                     ports.append(port)
                     weights.append(weight)
 
                 req = ofp_parser.OFPGroupMod(node.dp, ofproto_v1_3.OFPFC_ADD, ofproto_v1_3.OFPGT_SELECT, group_id, buckets)
                 node.dp.send_msg(req)
+
                 print "Installing group rule on :", sw, " Group ID = ", group_id, "Ports used = ", ports, " weights = ", weights
 
     #TODO: Ports/weigth dosent seem to work properly (pw[0] and pw[1])
@@ -682,3 +699,9 @@ class HFsw(app_manager.RyuApp):
         #Sends a Group_Stats_Request
         req = parser.OFPGroupStatsRequest(datapath,0, ofproto.OFPG_ALL,None)
         datapath.send_msg(req)
+
+
+#TODO: Handle policy crawler.
+#TODO: Handle flows withouth policies
+#TODO: Handle flows with multiple plolicies
+#TODO: Bandwidth decrementing function is not very stable
