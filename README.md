@@ -1,19 +1,20 @@
 # SDN traffic policing controller
-SDN controller used for traffic policing.
+SDN controller used for traffic policing in changing network conditions.
 
 # Software needed
 - Mininet VM
 - Open vSwitch 2.5 (https://gist.github.com/pichuang/9b362f802f40913c4b8f)
-- Ryu
+- Ryu controller
 
 # Ryu
-- Run application by issuing ./ruy-manager /path-to-controller-script/hfsw.py
+- Run application by issuing ./ryu/bin/ryu-manager /path-to-controller-script/hfsw.py
 - Stop it with control+c
-- Clean flow rules between stopping and starting the controller
+- Clean flow rules between stopping and starting the controller. See command below
 
 # Mininet
 - Mininet topology used is Topology01.py and Topology01 .mn Make sure to edit the IP-address to your computer where the Ryu-controller is running
 - Start (prefered) sudo ./mininet/examples/miniedit.py and open Topology01.mn from GUI
+  - When using ssh to Mininet VM, ensure that the " -X "property is used. Ex: ssh mininet@10.10.10.10 -X  
 - Start (alternative) sudo mn --custom Topology01.py
 - Commands:
   - h1 ping h2 - Ping from h1 to h2
