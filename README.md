@@ -9,7 +9,7 @@ SDN controller used for traffic policing in changing network conditions.
 # Ryu
 - Run application by issuing ./ryu/bin/ryu-manager /path-to-controller-script/hfsw.py
 - Stop it with control+c
-- Clean flow rules between stopping and starting the controller. See command below
+- Clean flow rules on all switches between stopping and starting the controller. See commands below
 
 # Mininet
 - Mininet topology used is Topology01.py and Topology01 .mn Make sure to edit the IP-address to your computer where the Ryu-controller is running
