@@ -22,3 +22,8 @@ SDN controller used for traffic policing in changing network conditions.
   - sudo ovs-ofctl -O OpenFlow13 dump-flows s1 - Dump flow rules on switch 1
   - sudo ovs-ofctl -O OpenFlow13 del-groups s1 - Delete group tables on switch 1
   - sudo ovs-ofctl -O OpenFlow13 dump-groups s1 - Dump group rules on switch 1
+
+# The controller
+- The controller is still under development, so expect bugs.
+- Policies can be defined in policy_inputs.py
+- To this date, only bandwidth requirements can be used as a policy requirement
