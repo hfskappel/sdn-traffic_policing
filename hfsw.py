@@ -26,7 +26,7 @@ old_src_rx_bytes = defaultdict(lambda:defaultdict(lambda:None))
 old_dst_tx_bytes = defaultdict(lambda:defaultdict(lambda:None))
 old_dst_rx_bytes = defaultdict(lambda:defaultdict(lambda:None))
 link_bandwidths = defaultdict(lambda:defaultdict(lambda:None))
-
+dropped = defaultdict(lambda:defaultdict(lambda:None))
 
 class HFsw(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -149,8 +149,6 @@ class HFsw(app_manager.RyuApp):
             switch.dp.send_msg(mod)
 
 
-
-
         #Generating random link speeds, for simulation purposes
         hub.sleep(0.1)
         for link in links_list:
@@ -204,7 +202,7 @@ class HFsw(app_manager.RyuApp):
                 stat.packet_count, stat.byte_count)
 
         except KeyError:
-            print "Error gitt"
+            print "Error!"
 
 
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
@@ -220,20 +218,28 @@ class HFsw(app_manager.RyuApp):
 
     #Packet handling function
     def packet_handler(self, src, dst, policy_match):
+        global link_bandwidths
+        #flow = [[path], policy, value] (single_path)
 
         flow = self.network_checker(src, dst, policy_match)
 
         if flow is not 0 and flow is not None:
 
             #If a accepted path is found: install it
-            if isinstance(flow[0], str) is True:    #One path is found
-                self.flow_rule_crawler(flow,"install", True)
+            if len(flow) == 1:    #One path is found
+
+                self.flow_rule_crawler(flow[0][0],"install", True)
+
+                #Saves the policy and the path to the running policy list
+                running_policies.append([flow[0][0], flow[0][1]])
+
+                #Update link-bandwidth
+                self.update_path_bandwidth(flow[0][0], flow[0][2])
 
 
             else:
-                #If paths are found, but traffic loading is needed. flow = [path, bandwidth, value]
-                #Iterates over the first path and compairs all the other paths with it
-                #flow = [policy, link_bandwidth, value]
+                #If paths are found, but traffic loading is needed. Iterates over the first path and compairs all the other paths with it
+                #flow = [policy, link_bandwidth, value, policy]
                 group_rules_created = []
                 for first in flow:
                     for f in range(len(first[0])-1):
@@ -257,12 +263,14 @@ class HFsw(app_manager.RyuApp):
 
                                             #Update the link bandwidth
                                             self.update_path_bandwidth(first[0],first[1])
+                                            running_policies.append([first[0], first[3]])
 
                                     port2 = self.find_out_port(first[0][f], second[0][s+1])
 
                                     weight = 100-weight
                                     group_rule.append([port2, weight])
                                     self.update_path_bandwidth(second[0],rest)
+                                    running_policies.append([second[0], second[3]])
 
 
                         #If ports has been appended, we know that a group rule must be created
@@ -296,6 +304,7 @@ class HFsw(app_manager.RyuApp):
                                 self.send_flow_rule_install(src, dst, port, first[0][f], "port")
 
 
+
         elif flow is 0:
             #lower_policies = priority and path
             print "No possible paths. Trying to move policies!"
@@ -316,10 +325,13 @@ class HFsw(app_manager.RyuApp):
                         return
 
             print "Policy moving executed, and still no path available!"
-            possible_paths = nx.all_shortest_paths(self.net, src, dst)
-            for p in possible_paths:
-                self.send_flow_rule_drop(p[-1], p[0], p[-2])
-                break
+            self.logger.info("Packet %s to %s",src, dst)
+            dropped[src][dst] = True
+
+            #possible_paths = nx.all_shortest_paths(self.net, src, dst)
+            #for p in possible_paths:
+                #self.send_flow_rule_drop(p[-1], p[0], p[-2])
+                #break
 
         else:
             print "Something went wrong!"
@@ -330,6 +342,7 @@ class HFsw(app_manager.RyuApp):
     def network_checker(self, src, dst, policy_match):
         sorted_actions = []
         flow_rule_policies = []
+        single_path = []
 
 
         for policy in policy_match:
@@ -381,14 +394,8 @@ class HFsw(app_manager.RyuApp):
                                 possible_paths = nx.shortest_path(self.net,src,dst)
                                 print "Found a path which matches requirements"
 
-                                #Saves the policy and the path to the running policy list
-                                running_policies.append([possible_paths, policy])
-
                                 #Skip traffic loading,due to a path is found
                                 traffic_load_bol = False
-
-                                #Update link-bandwidth
-                                self.update_path_bandwidth(possible_paths, value)
 
                                 #Adds the bad links back in top routing pool
                                 for l in bad_links:
@@ -398,9 +405,10 @@ class HFsw(app_manager.RyuApp):
                                     except nx.NetworkXError:
                                         print "Link is already added"
 
+                                single_path.append([possible_paths, policy, value])
 
                                 #Install flow rules
-                                return possible_paths
+                                return single_path
 
                                 #Adds the bad links back in top routing pool
                             for l in bad_links:
@@ -415,7 +423,6 @@ class HFsw(app_manager.RyuApp):
                                 print "Trying traffic loading"
                                 traffic_load_paths = []
                                 traffic_load_limit = value
-
 
                                 #Find all possible physical paths
                                 possible_paths = nx.all_shortest_paths(self.net, src, dst)
@@ -434,8 +441,7 @@ class HFsw(app_manager.RyuApp):
                                                     link_bandwidth = link[0]
 
                                     #Appends the path to a traffic_load_path
-                                    traffic_load_paths.append([p, link_bandwidth, value])
-                                    #TODO: BUG, paths added multiple times
+                                    traffic_load_paths.append([p,link_bandwidth, value, policy])
 
                                     for nodez in range(len(p)-1):
                                         for chosen in limited_links:
@@ -447,9 +453,6 @@ class HFsw(app_manager.RyuApp):
                                     if traffic_load_limit <= 0 and len(traffic_load_paths) <= 2:
                                         for p in traffic_load_paths:
                                             print "Bandwidth limit achieved, using ", p
-
-                                            #Saves the policies to a list with path
-                                            running_policies.append([p, policy])
 
                                         #Returns the list of the possible paths!
                                         return traffic_load_paths
@@ -478,7 +481,7 @@ class HFsw(app_manager.RyuApp):
 
         #lower_policy = running_policies
         #running_policies = [[possible_paths], policy]
-
+        remove = []
         action = lower_policy[1].get_actions()
 
         for key, value in action.iteritems():
@@ -488,7 +491,9 @@ class HFsw(app_manager.RyuApp):
 
                     #Removes the policy from the running list
                     for r in range(len(running_policies)):
+                        print len(running_policies)
                         if running_policies[r] == lower_policy:
+                            remove.append(r)
 
                             #Deletes the whole path in both directions!
                             self.flow_rule_crawler(lower_policy[0], "delete", True)
@@ -506,12 +511,11 @@ class HFsw(app_manager.RyuApp):
                                     port2 = self.find_out_port(lower_policy[0][node+1], lower_policy[0][node])
                                     link_bandwidths[lower_policy[0][node+1]][port2] = link_bandwidths[lower_policy[0][node+1]][port2] + value
 
-
                                     print "[POLICY DELETER] Link bandwidths updated on link connecting sw:",lower_policy[0][node], " and sw:",lower_policy[0][node+1], " with capasity ", link_bandwidths[lower_policy[0][node]][port1]
                                     print "[POLICY DELETER] Link bandwidths updated on link connecting sw:",lower_policy[0][node+1], " and sw:",lower_policy[0][node], " with capasity ", link_bandwidths[lower_policy[0][node+1]][port2]
 
-                            running_policies.pop(r)
-
+                    for pop in remove:
+                        running_policies.pop(pop)
 
 
     #Checks policy_lists for key value, based on priority. Returns a list of lower policies!
