@@ -67,12 +67,17 @@ class Policy(object):
 #Function that finds the associated policies
 def policy_finder(packet, policy_list):
     eth = packet.get_protocols(ethernet.ethernet)[0]
-    ip = packet.get_protocols(arp.arp)[0]
+    if packet.get_protocol(arp.arp):
+        ip = packet.get_protocols(arp.arp)[0]
+        ip_dst = ip.dst_ip
+        ip_src = ip.src_ip
+    elif packet.get_protocol(ipv4.ipv4):
+        ip = packet.get_protocols(ipv4.ipv4)[0]
+        ip_dst = ip.dst
+        ip_src = ip.src
     eth_dst = eth.dst
     eth_src = eth.src
     eth_type = eth.ethertype
-    ip_dst = ip.dst_ip
-    ip_src = ip.src_ip
     proto = ip.proto
     del action_list[:]
 

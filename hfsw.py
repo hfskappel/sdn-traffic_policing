@@ -4,7 +4,7 @@ from ryu.controller.handler import MAIN_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.topology import event
 from ryu.topology.api import get_switch, get_link, get_host
-from ryu.lib.packet import packet, ethernet, arp, ipv4
+from ryu.lib.packet import packet, ethernet, arp, ether_types
 import networkx as nx
 import policy_manager
 from policy_inputs import generate_policies
@@ -19,7 +19,7 @@ switch_list = []
 links_list = []
 running_policies = []
 running_flows = []
-sleeptime = 5
+sleeptime = 20
 port_status = defaultdict(lambda:defaultdict(lambda:None))
 old_src_tx_bytes = defaultdict(lambda:defaultdict(lambda:None))
 old_src_rx_bytes = defaultdict(lambda:defaultdict(lambda:None))
@@ -36,7 +36,6 @@ class HFsw(app_manager.RyuApp):
         self.mac_to_port = {}
         self.topology_api_app = self
         self.net=nx.DiGraph()
-        #self.path=nx.DiGraph()
         self.monitor_thread = hub.spawn(self._network_monitor)
         self.new_flow_stats = 0
 
@@ -50,69 +49,81 @@ class HFsw(app_manager.RyuApp):
     def packet_in_handler(self, ev):
         msg = ev.msg
         pkt = packet.Packet(msg.data)
-        arp_pkt = pkt.get_protocol(arp.arp)
-        if arp_pkt:
-            dp = msg.datapath
-            eth = pkt.get_protocols(ethernet.ethernet)[0]
-            dpid = dp.id
-            dst = eth.dst
-            src = eth.src
-            in_port = msg.match['in_port']
-            ofp_parser = dp.ofproto_parser
+        eth = pkt.get_protocols(ethernet.ethernet)[0]
+        if eth.ethertype == ether_types.ETH_TYPE_LLDP:
+            return
+        dp = msg.datapath
+        dpid = dp.id
+        dst = eth.dst
+        src = eth.src
+        in_port = msg.match['in_port']
+        ofp_parser = dp.ofproto_parser
+        self.logger.info("Packet in sw %s %s to %s port %s", dpid, src, dst, in_port)
 
-            if src not in self.net: #Learn it
-                self.net.add_node(src) # Add a node to the graph
-                self.net.add_edge(src,dpid) # Add a link from the node to it's edge switch
-                self.net.add_edge(dpid,src,{'port':in_port})  # Add link from switch to node and make sure you are identifying the output port.
-                print "Node added to grap, Src:", src, " connected to Sw:", dpid, " on port: ",in_port
+        if src not in self.net: #Learn it
+            self.net.add_node(src) # Add a node to the graph
+            self.net.add_edge(src,dpid) # Add a link from the node to it's edge switch
+            self.net.add_edge(dpid,src,{'port':in_port})  # Add link from switch to node and make sure you are identifying the output port.
+            print "Node added to grap, Src:", src, " connected to Sw:", dpid, " on port: ",in_port
 
-            if dst in self.net:
-                if nx.has_path(self.net, src, dst):
-                    try:
-                        #Finds policies
-                        policy_match = policy_manager.policy_finder(pkt, policy_list)
+        if dst in self.net:
+            if nx.has_path(self.net, src, dst):
+                try:
+                    #Finds policies
+                    policy_match = policy_manager.policy_finder(pkt, policy_list)
 
-                        #If an attatched policy is found.
-                        if len(policy_match) is not 0:
-                            self.packet_handler(src, dst, policy_match)
-                        else:
-                            print "No policy found"
-                            #If no policy is found, use random path.
-                            path = nx.shortest_path(self.net,src,dst)
+                    #If an attatched policy is found.
+                    if len(policy_match) is not 0:
+                        self.packet_handler(src, dst, policy_match)
+                    else:
+                        print "No policy found"
+                        #If no policy is found, use random path.
+                        path = nx.shortest_path(self.net,src,dst)
 
-                            #Installs flows and saves the flows
-                            self.flow_rule_crawler(path,"install", True)
-                            running_flows.append(path)
+                        #Installs flows and saves the flows
+                        self.flow_rule_crawler(path,"install", True)
+                        running_flows.append(path)
 
-
-                    except nx.NetworkXNoPath:
-                        print "Could not create flow path"
-                else:
-                    print "No path found between ", src, " and ", dst
-
-            else:
-                #Iterates over the switches and sends ARP requests on all ports, except links connecting other switches.
-                #(In order to avoid arp broadcast loops).
-                print "Flooding ARP"
-
-                for node in switch_list:
-                            for n in node.ports:
-                                host_port = True
-                                for l in links:
-                                    #If it is a link connecting two switches
-                                    if l[0] == node.dp.id and l[2]['port'] == n.port_no:
-                                        host_port = False
-                                        break
-                                    #If it is the port where the request is sent from
-                                    elif node.dp.id == dpid and n.port_no == in_port:
-                                        host_port = False
-                                        break
-
-                                if host_port:
-                                    actions = [ofp_parser.OFPActionOutput(port=n.port_no)]
+                    #Forwards the ARP response after path is created
+                    for running in running_policies:
+                        if running[0][-1] == dst:
+                            for node in switch_list:
+                                if running[0][-2] == node.dp.id:
+                                    port = self.net[running[0][-2]][dst]['port']
+                                    actions = [ofp_parser.OFPActionOutput(port=port)]
                                     out = ofp_parser.OFPPacketOut(datapath=node.dp, buffer_id=0xffffffff, in_port=in_port, actions=actions, data=msg.data)
                                     node.dp.send_msg(out)
-                                    print "ARP forwarded on sw:", node.dp.id, " out port: ", n.port_no
+                                    print "ARP reply forwarded on sw:", node.dp.id, " out port: ", port
+                                    break
+
+                except nx.NetworkXNoPath:
+                    print "Could not create flow path"
+            else:
+                print "No path found between ", src, " and ", dst
+
+        else:
+            #Iterates over the switches and sends ARP requests on all ports, except links connecting other switches.
+            #(In order to avoid arp broadcast loops).
+            print "Flooding ARP"
+
+            for node in switch_list:
+                        for n in node.ports:
+                            host_port = True
+                            for l in links:
+                                #If it is a link connecting two switches
+                                if l[0] == node.dp.id and l[2]['port'] == n.port_no:
+                                    host_port = False
+                                    break
+                                #If it is the port where the request is sent from
+                                elif node.dp.id == dpid and n.port_no == in_port:
+                                    host_port = False
+                                    break
+
+                            if host_port:
+                                actions = [ofp_parser.OFPActionOutput(port=n.port_no)]
+                                out = ofp_parser.OFPPacketOut(datapath=node.dp, buffer_id=0xffffffff, in_port=in_port, actions=actions, data=msg.data)
+                                node.dp.send_msg(out)
+                                print "ARP request forwarded on sw:", node.dp.id, " out port: ", n.port_no
 
 
 
@@ -618,11 +629,12 @@ class HFsw(app_manager.RyuApp):
 
 
     def _network_monitor(self):
+        print "LALALA"
         while True:
             for node in switch_list:
                 self.send_stats_request(node.dp)
-            #for link in links_list:
-                #self.check_link(link, True, True)
+            for link in links_list:
+                self.check_link(link, True, True)
             hub.sleep(sleeptime)
 
 
@@ -717,9 +729,6 @@ class HFsw(app_manager.RyuApp):
                 node.dp.send_msg(mod)
 
 
-
-
-
     def send_flow_rule_delete(self,src, dst, out_port, sw, action):
         print "Deleting flow rule on :", sw, "Match conditions: eth_src =  ", src, " and eth_dst = ", dst, ". Action: out_port/group =  ", out_port
         for node in switch_list:
@@ -782,8 +791,3 @@ class HFsw(app_manager.RyuApp):
         #Sends a Group_Stats_Request
         req = parser.OFPGroupStatsRequest(datapath,0, ofproto.OFPG_ALL,None)
         datapath.send_msg(req)
-
-
-#TODO: Handle policy crawler. Delete flows withouth any policies first?
-#TODO: Handle flows with multiple policies
-#TODO: Bandwidth decrementing function is not very stable Bandwidth limit achieved, using  [['e2:ac:ce:83:82:8b', 2, 4, 3, '06:77:b1:7a:9e:0c'], 2, 1]
