@@ -26,7 +26,10 @@ old_src_rx_bytes = defaultdict(lambda:defaultdict(lambda:None))
 old_dst_tx_bytes = defaultdict(lambda:defaultdict(lambda:None))
 old_dst_rx_bytes = defaultdict(lambda:defaultdict(lambda:None))
 link_bandwidths = defaultdict(lambda:defaultdict(lambda:None))
+link_bandwidths_buffer = defaultdict(lambda:defaultdict(lambda:None))
+link_bandwidths_original = defaultdict(lambda:defaultdict(lambda:None))
 dropped = defaultdict(lambda:defaultdict(lambda:None))
+
 
 class HFsw(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -130,6 +133,7 @@ class HFsw(app_manager.RyuApp):
             else:
                 print "Waiting for the host's local ARP cache to reset"
 
+
     #Listens for connecting switches (ConnectionUp)
     @set_ev_cls(event.EventSwitchEnter)
     def get_topology_data(self, ev):
@@ -158,6 +162,8 @@ class HFsw(app_manager.RyuApp):
             if link_bandwidths[link.src.dpid][link.src.port_no] is None and link_bandwidths[link.dst.dpid][link.dst.port_no] is None:
                 link_bandwidths[link.src.dpid][link.src.port_no] = linkspeed
                 link_bandwidths[link.dst.dpid][link.dst.port_no] = linkspeed
+                link_bandwidths_original[link.src.dpid][link.src.port_no] = linkspeed
+                link_bandwidths_original[link.dst.dpid][link.dst.port_no] = linkspeed
                 print "Linkspeed detected: ", link, " speed = ", linkspeed
 
 
@@ -176,21 +182,6 @@ class HFsw(app_manager.RyuApp):
         links.append((link.src.dpid,link.dst.dpid,{'port':link.src.port_no}))
         #print "Link discovered between sw:", link.src.dpid, " and sw:", link.dst.dpid, ". Total number of active links: ",len(links_list)/2
         self.net.add_edges_from(links)
-
-        #for switch in switch_list:
-         #   for n in switch.ports:
-          #      for l in links:
-                        #If it is a link connecting two switches
-           #             if l[0] == switch.dp.id and l[2]['port'] == n.port_no:
-            #                ofp_parser = switch.dp.ofproto_parser
-             #               mod = ofp_parser.OFPPortMod(datapath=switch.dp, port_no=n.port_no, hw_addr=n.hw_addr, config=ofproto_v1_3.OFPPC_NO_FWD, mask=ofproto_v1_3.OFPPC_NO_FWD, advertise=ofproto_v1_3.OFPPF_10GB_FD)
-              #              switch.dp.send_msg(mod)
-               #             print "YA MAN"
-              #  if n.port_no > 999:
-               #     ofp_parser = switch.dp.ofproto_parser
-                #    mod = ofp_parser.OFPPortMod(datapath=switch.dp, port_no=n.port_no, hw_addr=n.hw_addr, config=ofproto_v1_3.OFPPC_NO_FWD, mask=ofproto_v1_3.OFPPC_NO_FWD, advertise=ofproto_v1_3.OFPPF_10GB_FD)
-                 #   switch.dp.send_msg(mod)
-
 
 
     @set_ev_cls(event.EventLinkDelete)
@@ -374,7 +365,6 @@ class HFsw(app_manager.RyuApp):
         sorted_actions = []
         flow_rule_policies = []
         single_path = []
-
 
         for policy in policy_match:
             #Fetches the sorted policies
@@ -652,8 +642,6 @@ class HFsw(app_manager.RyuApp):
 
 
 
-
-
     #Returns the action value
     def policy_action_fetcher(self, policy, condition):
         actions = [policy.get_actions()]
@@ -665,14 +653,37 @@ class HFsw(app_manager.RyuApp):
 
 
 
-
     def _network_monitor(self):
+        ma = 1
         while True:
             for node in switch_list:
                 self.send_stats_request(node.dp)
             for link in links_list:
-                self.check_link(link, True, True)
+                moving_average = self.check_link(link, False, True)
+                if link_bandwidths_buffer[link.src.dpid][link.src.port_no] is not None:
+                    if link_bandwidths_original[link.src.dpid][link.src.port_no] > moving_average:
+                        link_bandwidths_buffer[link.src.dpid][link.src.port_no] = link_bandwidths_original[link.src.dpid][link.src.port_no]-\
+                        (link_bandwidths_buffer[link.src.dpid][link.src.port_no]*(ma-1)+moving_average)/ma
+                    else:
+                        link_bandwidths_buffer[link.src.dpid][link.src.port_no] = link_bandwidths_original[link.src.dpid][link.src.port_no]-\
+                        (link_bandwidths_buffer[link.src.dpid][link.src.port_no]*(ma-1)+link_bandwidths_original[link.src.dpid][link.src.port_no])/ma
+
+                else:
+                    if link_bandwidths_original[link.src.dpid][link.src.port_no] > moving_average:
+                        link_bandwidths_buffer[link.src.dpid][link.src.port_no] = link_bandwidths_original[link.src.dpid][link.src.port_no]-moving_average
+                    else:
+                        link_bandwidths_buffer[link.src.dpid][link.src.port_no] = 0.0
+
+                print "Link buffer", link_bandwidths_buffer[link.src.dpid][link.src.port_no]
+            if ma < 30:
+                ma += ma
+            else:
+                ma = 1
+                link_bandwidths_buffer.clear()
             hub.sleep(sleeptime)
+
+    #TODO: More work on the moving average function!
+
 
 
     #Iterating function to inspect a given link for packet loss and transmitting traffic
@@ -706,7 +717,7 @@ class HFsw(app_manager.RyuApp):
 
         old_traffic = (old_src_tx_bytes[link.src.dpid][link.src.port_no]+old_src_rx_bytes[link.src.dpid][link.src.port_no]+ \
                        old_dst_tx_bytes[link.dst.dpid][link.dst.port_no] + old_dst_rx_bytes[link.dst.dpid][link.dst.port_no])
-        traffic = abs((8*float(old_traffic - (src_tx_bytes+src_rx_bytes+dst_tx_bytes+dst_rx_bytes))/4/1000000)/sleeptime)
+        traffic = float("{0:.1f}".format(abs((8*float(old_traffic - (src_tx_bytes+src_rx_bytes+dst_tx_bytes+dst_rx_bytes))/4/1000000)/sleeptime)))
 
         old_src_tx_bytes[link.src.dpid][link.src.port_no] = src_tx_bytes
         old_src_rx_bytes[link.src.dpid][link.src.port_no] = src_rx_bytes
@@ -822,9 +833,9 @@ class HFsw(app_manager.RyuApp):
         datapath.send_msg(req)
 
         #Sends a Port_Stats_Request
-        req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
-        datapath.send_msg(req)
+        #req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
+        #datapath.send_msg(req)
 
         #Sends a Group_Stats_Request
-        req = parser.OFPGroupStatsRequest(datapath,0, ofproto.OFPG_ALL,None)
-        datapath.send_msg(req)
+        #req = parser.OFPGroupStatsRequest(datapath,0, ofproto.OFPG_ALL,None)
+        #datapath.send_msg(req)
