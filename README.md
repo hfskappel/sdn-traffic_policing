@@ -3,7 +3,7 @@ SDN controller used for traffic policing in changing network conditions.
 
 # Software needed
 - Mininet VM
-- Open vSwitch 2.5 (https://gist.github.com/pichuang/9b362f802f40913c4b8f)
+- Open vSwitch 2.5 (https://github.com/mininet/mininet/wiki/Installing-new-version-of-Open-vSwitch)
 - Ryu controller
 
 # Ryu
