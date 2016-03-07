@@ -85,6 +85,7 @@ class HFsw(app_manager.RyuApp):
                         running_flows.append(path)
 
                     #Forwards the ARP response after path is created
+                    #TODO: Fix bug in arp-function. Packet-out does not work properly
                     for running in running_policies:
                         if running[0][-1] == dst:
                             for node in switch_list:
@@ -104,28 +105,30 @@ class HFsw(app_manager.RyuApp):
         else:
             #Iterates over the switches and sends ARP requests on all ports, except links connecting other switches.
             #(In order to avoid arp broadcast loops).
-            print "Flooding ARP"
+            pkt_arp = pkt.get_protocol(arp.arp)
 
-            for node in switch_list:
-                        for n in node.ports:
-                            host_port = True
-                            for l in links:
-                                #If it is a link connecting two switches
-                                if l[0] == node.dp.id and l[2]['port'] == n.port_no:
-                                    host_port = False
-                                    break
-                                #If it is the port where the request is sent from
-                                elif node.dp.id == dpid and n.port_no == in_port:
-                                    host_port = False
-                                    break
+            if pkt_arp:
+                pkt.add_protocol(ethernet.ethernet(ethertype=eth.ethertype,dst=dst, src=src))
+                pkt.add_protocol(arp.arp(opcode=arp.ARP_REQUEST, src_mac=pkt_arp.src_mac, src_ip=pkt_arp.src_ip, dst_mac=pkt_arp.dst_mac, dst_ip=pkt_arp.dst_ip))
 
-                            if host_port:
-                                actions = [ofp_parser.OFPActionOutput(port=n.port_no)]
-                                out = ofp_parser.OFPPacketOut(datapath=node.dp, buffer_id=0xffffffff, in_port=in_port, actions=actions, data=msg.data)
-                                node.dp.send_msg(out)
-                                print "ARP request forwarded on sw:", node.dp.id, " out port: ", n.port_no
+                for node in switch_list:
+                    for n in node.ports:
+                        host_port = True
+                        for l in links:
+                            #If it is a link connecting two switches
+                            if l[0] == node.dp.id and l[2]['port'] == n.port_no:
+                                host_port = False
+                                break
+                            #If it is the port where the request is sent from
+                            elif node.dp.id == dpid and n.port_no == in_port:
+                                host_port = False
+                                break
 
-
+                        if host_port:
+                            self._send_packet(node.dp, n.port_no, pkt)
+                            print "ARP request forwarded on sw: ", node.dp.id, " out port: ", n.port_no
+            else:
+                print "Waiting for the host's local ARP cache to reset"
 
     #Listens for connecting switches (ConnectionUp)
     @set_ev_cls(event.EventSwitchEnter)
@@ -148,11 +151,10 @@ class HFsw(app_manager.RyuApp):
             mod = switch.dp.ofproto_parser.OFPFlowMod(datapath=switch.dp, match=match, cookie=0,command=ofproto_v1_3.OFPFC_ADD, idle_timeout=0, hard_timeout=0,priority=0, instructions=inst)
             switch.dp.send_msg(mod)
 
-
         #Generating random link speeds, for simulation purposes
         hub.sleep(0.1)
         for link in links_list:
-            linkspeed = random.randint(2,2)
+            linkspeed = random.randint(20,20)
             if link_bandwidths[link.src.dpid][link.src.port_no] is None and link_bandwidths[link.dst.dpid][link.dst.port_no] is None:
                 link_bandwidths[link.src.dpid][link.src.port_no] = linkspeed
                 link_bandwidths[link.dst.dpid][link.dst.port_no] = linkspeed
@@ -174,6 +176,21 @@ class HFsw(app_manager.RyuApp):
         links.append((link.src.dpid,link.dst.dpid,{'port':link.src.port_no}))
         #print "Link discovered between sw:", link.src.dpid, " and sw:", link.dst.dpid, ". Total number of active links: ",len(links_list)/2
         self.net.add_edges_from(links)
+
+        #for switch in switch_list:
+         #   for n in switch.ports:
+          #      for l in links:
+                        #If it is a link connecting two switches
+           #             if l[0] == switch.dp.id and l[2]['port'] == n.port_no:
+            #                ofp_parser = switch.dp.ofproto_parser
+             #               mod = ofp_parser.OFPPortMod(datapath=switch.dp, port_no=n.port_no, hw_addr=n.hw_addr, config=ofproto_v1_3.OFPPC_NO_FWD, mask=ofproto_v1_3.OFPPC_NO_FWD, advertise=ofproto_v1_3.OFPPF_10GB_FD)
+              #              switch.dp.send_msg(mod)
+               #             print "YA MAN"
+              #  if n.port_no > 999:
+               #     ofp_parser = switch.dp.ofproto_parser
+                #    mod = ofp_parser.OFPPortMod(datapath=switch.dp, port_no=n.port_no, hw_addr=n.hw_addr, config=ofproto_v1_3.OFPPC_NO_FWD, mask=ofproto_v1_3.OFPPC_NO_FWD, advertise=ofproto_v1_3.OFPPF_10GB_FD)
+                 #   switch.dp.send_msg(mod)
+
 
 
     @set_ev_cls(event.EventLinkDelete)
@@ -336,6 +353,20 @@ class HFsw(app_manager.RyuApp):
         else:
             print "Something went wrong!"
 
+
+    def _send_packet(self, datapath, port, pkt):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        pkt.serialize()
+        #self.logger.info("packet-out %s" % (pkt,))
+        data = pkt.data
+        actions = [parser.OFPActionOutput(port=port)]
+        out = parser.OFPPacketOut(datapath=datapath,
+                                  buffer_id=ofproto.OFP_NO_BUFFER,
+                                  in_port=ofproto.OFPP_CONTROLLER,
+                                  actions=actions,
+                                  data=data)
+        datapath.send_msg(out)
 
 
     #Iterates through network data and checks if network parameters is accepted by the policy.
@@ -514,8 +545,11 @@ class HFsw(app_manager.RyuApp):
                                     print "[POLICY DELETER] Link bandwidths updated on link connecting sw:",lower_policy[0][node], " and sw:",lower_policy[0][node+1], " with capasity ", link_bandwidths[lower_policy[0][node]][port1]
                                     print "[POLICY DELETER] Link bandwidths updated on link connecting sw:",lower_policy[0][node+1], " and sw:",lower_policy[0][node], " with capasity ", link_bandwidths[lower_policy[0][node+1]][port2]
 
-                    for pop in remove:
-                        running_policies.pop(pop)
+                    try:
+                        for pop in remove:
+                            running_policies.pop(pop)
+                    except IndexError:
+                        self.logger("Iterating error due to remove items from running policies")
 
 
     #Checks policy_lists for key value, based on priority. Returns a list of lower policies!
@@ -633,7 +667,6 @@ class HFsw(app_manager.RyuApp):
 
 
     def _network_monitor(self):
-        print "LALALA"
         while True:
             for node in switch_list:
                 self.send_stats_request(node.dp)
