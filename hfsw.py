@@ -19,17 +19,16 @@ switch_list = []
 links_list = []
 running_policies = []
 running_flows = []
-sleeptime = 20
+sleeptime = 10
 port_status = defaultdict(lambda:defaultdict(lambda:None))
-old_src_tx_bytes = defaultdict(lambda:defaultdict(lambda:None))
-old_src_rx_bytes = defaultdict(lambda:defaultdict(lambda:None))
-old_dst_tx_bytes = defaultdict(lambda:defaultdict(lambda:None))
-old_dst_rx_bytes = defaultdict(lambda:defaultdict(lambda:None))
+old_src_rxtx_bytes = defaultdict(lambda:defaultdict(lambda:None))
+old_dst_rxtx_bytes = defaultdict(lambda:defaultdict(lambda:None))
+old_src_rxtx_packets = defaultdict(lambda:defaultdict(lambda:None))
+old_dst_rxtx_packets = defaultdict(lambda:defaultdict(lambda:None))
 link_bandwidths = defaultdict(lambda:defaultdict(lambda:None))
 link_bandwidths_ma = defaultdict(lambda:defaultdict(lambda:None))
 link_bandwidths_original = defaultdict(lambda:defaultdict(lambda:None))
 dropped = defaultdict(lambda:defaultdict(lambda:None))
-
 
 class HFsw(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -90,7 +89,7 @@ class HFsw(app_manager.RyuApp):
 
                     #Forwards the ARP response after path is created
                     for running in running_policies:
-                        if running[0][-1] == dst:
+                        if running[0][-1] == dst and dropped[src][dst] is None:
                             for node in switch_list:
                                 if running[0][-2] == node.dp.id:
                                     port = self.net[running[0][-2]][dst]['port']
@@ -331,39 +330,44 @@ class HFsw(app_manager.RyuApp):
                     #Counts the running flows down a specific path
                     for r in running_policies:
                         if p ==r[0]:
-                            flow_count += flow_count
+                            flow_count = flow_count+1
 
-                    try:
-                        #Finds average flowing traffic
-                        for path in range(len(p)-1):
-                            if path != p[0] and path+1 != p[-1]:
-                                port = self.find_out_port(path, path+1)
-                                average_path = average_path + link_bandwidths_ma[path][port]
-                                full_path = full_path + link_bandwidths[path][port]
+                    #Finds average flowing traffic
+                    if flow_count is not 0:
+                        try:
+                            for path in range(len(p)-1):
+                                if p[path] != p[0] and p[path+1] != p[-1]:
+                                    port = self.find_out_port(p[path], p[path+1])
+                                    average_path = average_path + link_bandwidths_ma[p[path]][port]
+                                    full_path = full_path + link_bandwidths_original[p[path]][port]
 
-                        #Average flowing traffic, full link capacity and flowing per-flow
-                        average_path = average_path/(len(p)-2)
-                        full_path = full_path/(len(p)-2)
-                        average_flow = average_path/flow_count
-                        capacity = full_path - average_path+average_flow
+                            #Average flowing traffic, full link capacity and flowing per-flow
+                            average_path = average_path/(len(p)-3)
+                            full_path = full_path/(len(p)-3)
+                            average_flow = average_path/flow_count
+                            capacity = full_path - (average_path + average_flow)
 
-                    #TODO: Check if this works properly
+                            print "Average per flow :", average_flow, "Average per path ", average_path, "Full path bandwidth", full_path, "with remaining capacity ", capacity
 
-                    except TypeError:
-                        print "YO MAN"
-                        return
+                            req = self.policy_action_fetcher(bandwidth_requirement[0],"bandwidth_requirement")
+                            #If less than half of the link capacity is in use by adding the new flow
+                            #and the capacity is higher that the policy requirement
 
-                    #If less than half of the link capacity is in use by adding the new flow
-                    if capacity >= full_path/2:
-                        ma_path.append([capacity, path])
+                            if capacity >= full_path/2 and capacity >= req:
+                                ma_path.append([capacity, p])
+
+                        except TypeError:
+                            print "No flow path statistics available: no update yet"
+                            ma_path = []
 
                 if len(ma_path) > 0:
-                    sorted(ma_path, key=ma_path[0])
+                    #Sorts by capacity
+                    sorted(ma_path)
                     for ma in ma_path:
-                        self.flow_rule_crawler(ma,"install", True)
-
-                        #TODO: Saves the policy and the path to the running policy list
-                        #running_policies.append([ma, p)
+                        print ma
+                        self.flow_rule_crawler(ma[1],"install", True)
+                        running_policies.append([ma[1], p])
+                        break
 
                 else:
                     #lower_policies = priority and path
@@ -378,9 +382,9 @@ class HFsw(app_manager.RyuApp):
                             self.policy_deleter(lower)
 
                             #Checks if we get a match
-                            flow = self.bandwidth_checker(src, dst, policy_match)
+                            bandwidth_requirement = self.bandwidth_checker(src, dst, policy_match)
 
-                            if flow is not 0 and flow is not None:
+                            if bandwidth_requirement is not 0:
                                 print "Ending iteration, found a path"
                                 return
 
@@ -696,71 +700,85 @@ class HFsw(app_manager.RyuApp):
         while True:
             for node in switch_list:
                 self.send_stats_request(node.dp)
+                hub.sleep(1)
+
             for link in links_list:
-                flowing = self.check_link(link, False, True)
+                #Checks flowing traffic
+                flowing = self.check_link(link, True, True)
 
                 if link_bandwidths_ma[link.src.dpid][link.src.port_no] is not None:
-                    link_bandwidths_ma[link.src.dpid][link.src.port_no] = (link_bandwidths_ma[link.src.dpid][link.src.port_no]*(ma-1)+flowing)/ma
+                    link_bandwidths_ma[link.src.dpid][link.src.port_no] = ((link_bandwidths_ma[link.src.dpid][link.src.port_no]*(ma-1))+flowing[1])/ma
 
                 else:
-                    link_bandwidths_ma[link.src.dpid][link.src.port_no] = flowing
+                    link_bandwidths_ma[link.src.dpid][link.src.port_no] = flowing[1]
 
-                print "Link average on link ", link, " is ", link_bandwidths_ma[link.src.dpid][link.src.port_no], "ma count", ma
+                print "Link average on link, SW", link.src.dpid, " to SW",link.dst.dpid, " is ", link_bandwidths_ma[link.src.dpid][link.src.port_no], "ma count", ma
+                print flowing[0]
 
-            if ma < 80: #Resets every 200 seconds
-                ma += ma
+
+            if ma < 20:
+                ma = ma+1
             else:
                 ma = 1
                 link_bandwidths_ma.clear()
-                print "cleared!"
+                #Clears blocked src-dst pairs
+                dropped.clear()
             hub.sleep(sleeptime)
 
 
     #Iterating function to inspect a given link for packet loss and transmitting traffic
     def check_link(self, link, measure_loss, measure_bandwidth):
-        global old_dst_tx_bytes, old_src_tx_bytes, old_src_tx_bytes, old_src_tx_bytes
-        src_tx_bytes = 0
-        dst_tx_bytes = 0
-        src_rx_bytes = 0
-        dst_rx_bytes = 0
+        global old_dst_rxtx_bytes, old_src_rxtx_bytes, old_dst_rxtx_packets, old_src_rxtx_packets
+        src_rxtx_bytes = 0
+        dst_rxtx_bytes = 0
+        src_rxtx_pkts = 0
+        dst_rxtx_pkts = 0
+
 
         for stat in port_status[link.src.dpid]:
             if link.src.port_no == stat.port_no:
-                src_rx_bytes = stat.rx_bytes
-                src_tx_bytes = stat.tx_bytes
+                src_rxtx_bytes = stat.rx_bytes + stat.tx_bytes
+                src_rxtx_pkts = stat.rx_packets + stat.tx_packets
 
         for stat in port_status[link.dst.dpid]:
             if link.dst.port_no == stat.port_no:
-                dst_rx_bytes = stat.rx_bytes
-                dst_tx_bytes = stat.tx_bytes
+                dst_rxtx_bytes = stat.rx_bytes + stat.tx_bytes
+                dst_rxtx_pkts = stat.rx_packets + stat.tx_packets
 
-        if old_src_tx_bytes[link.src.dpid][link.src.port_no] is None and old_dst_tx_bytes[link.dst.dpid][link.dst.port_no] \
-                is None and old_src_rx_bytes[link.src.dpid][link.src.port_no] is None and old_dst_rx_bytes[link.dst.dpid][link.dst.port_no] is None:
-            old_src_rx_bytes[link.src.dpid][link.src.port_no] = src_rx_bytes
-            old_src_tx_bytes[link.src.dpid][link.src.port_no] = src_tx_bytes
-            old_dst_rx_bytes[link.dst.dpid][link.dst.port_no] = dst_rx_bytes
-            old_dst_tx_bytes[link.dst.dpid][link.dst.port_no] = dst_tx_bytes
+        if old_src_rxtx_bytes[link.src.dpid][link.src.port_no] is None and old_dst_rxtx_bytes[link.dst.dpid][link.dst.port_no] is None:
+            old_src_rxtx_bytes[link.src.dpid][link.src.port_no] = src_rxtx_bytes
+            old_dst_rxtx_bytes[link.dst.dpid][link.dst.port_no] = dst_rxtx_bytes
 
-        pathloss = abs(((old_src_tx_bytes[link.src.dpid][link.src.port_no]+old_src_rx_bytes[link.src.dpid][link.src.port_no]) - \
-                   (old_dst_tx_bytes[link.dst.dpid][link.dst.port_no]+old_dst_rx_bytes[link.dst.dpid][link.dst.port_no])) - \
-                   ((src_rx_bytes+src_tx_bytes)-(dst_rx_bytes+dst_tx_bytes)))
+        if old_src_rxtx_packets[link.src.dpid][link.src.port_no] is None and old_dst_rxtx_packets[link.dst.dpid][link.dst.port_no] is None:
+            old_dst_rxtx_packets[link.dst.dpid][link.dst.port_no] = dst_rxtx_pkts
+            old_src_rxtx_packets[link.src.dpid][link.src.port_no] = src_rxtx_pkts
 
-        old_traffic = (old_src_tx_bytes[link.src.dpid][link.src.port_no]+old_src_rx_bytes[link.src.dpid][link.src.port_no]+ \
-                       old_dst_tx_bytes[link.dst.dpid][link.dst.port_no] + old_dst_rx_bytes[link.dst.dpid][link.dst.port_no])
-        traffic = float("{0:.1f}".format(abs((8*float(old_traffic - (src_tx_bytes+src_rx_bytes+dst_tx_bytes+dst_rx_bytes))/4/1000000)/sleeptime)))
+#
+        #
+        #
+        #TODO: Ended here. Fix the dropped packets function
+        #
+        #
 
-        old_src_tx_bytes[link.src.dpid][link.src.port_no] = src_tx_bytes
-        old_src_rx_bytes[link.src.dpid][link.src.port_no] = src_rx_bytes
-        old_dst_tx_bytes[link.dst.dpid][link.dst.port_no] = dst_tx_bytes
-        old_dst_rx_bytes[link.dst.dpid][link.dst.port_no] = dst_rx_bytes
 
+        pathloss = "LOL"
+        #pathloss = abs((old_src_rxtx_packets[link.src.dpid][link.src.port_no]-old_dst_rxtx_packets[link.dst.dpid][link.dst.port_no]) - (src_rxtx_pkts-dst_rxtx_pkts))
+
+        old_traffic = (old_src_rxtx_bytes[link.src.dpid][link.src.port_no] + old_dst_rxtx_bytes[link.dst.dpid][link.dst.port_no])
+
+        traffic = float("{0:.1f}".format(abs((8*float(old_traffic - (src_rxtx_bytes+dst_rxtx_bytes))/4/1000000)/sleeptime)))
+
+        old_src_rxtx_bytes[link.src.dpid][link.src.port_no] = src_rxtx_bytes
+        old_dst_rxtx_bytes[link.dst.dpid][link.dst.port_no] = dst_rxtx_bytes
+        old_src_rxtx_packets[link.src.dpid][link.src.port_no] = src_rxtx_pkts
+        old_src_rxtx_packets[link.dst.dpid][link.dst.port_no] = dst_rxtx_pkts
 
         if measure_bandwidth and measure_loss:
-            #print traffic, " mbit/s and with packet loss of ", pathloss, "the last ", sleeptime, "seconds at link:", link.src.dpid, "-", link.dst.dpid
-            return pathloss, traffic
+            #print traffic, " mbit/s and with packet loss of ", dropped, "the last ", sleeptime, "seconds at link:", link.src.dpid, "-", link.dst.dpid
+            return [pathloss, traffic]
 
         elif measure_loss:
-            #print pathloss, "bytes lost the last ", sleeptime, "  seconds at link ", link.src.dpid, " - ", link.dst.dpid
+            #print dropped, "bytes lost the last ", sleeptime, "  seconds at link ", link.src.dpid, " - ", link.dst.dpid
             return pathloss
 
         elif measure_bandwidth:
@@ -870,7 +888,8 @@ class HFsw(app_manager.RyuApp):
         #req = parser.OFPGroupStatsRequest(datapath,0, ofproto.OFPG_ALL,None)
         #datapath.send_msg(req)
 
-# TODO: 1. Be able to use the moving average to add more flows to the link. Use safety margins
 # TODO: 2. Move the flows based on observed packet drops
 # TODO: 3. Include more policy settings such as block/delay?
-#TODO: create a policy object for running flows which does not have a policy
+
+#TODO: FIX create a policy object for running flows which does not have a policy
+#TODO: FIX What happends to a running policy when traffic loading is applied? It needs to be splitted
