@@ -157,7 +157,7 @@ class HFsw(app_manager.RyuApp):
         #Generating random link speeds, for simulation purposes
         hub.sleep(0.1)
         for link in links_list:
-            linkspeed = random.randint(2,2)
+            linkspeed = random.randint(20,20)
             if link_bandwidths[link.src.dpid][link.src.port_no] is None and link_bandwidths[link.dst.dpid][link.dst.port_no] is None:
                 link_bandwidths[link.src.dpid][link.src.port_no] = linkspeed
                 link_bandwidths[link.dst.dpid][link.dst.port_no] = linkspeed
@@ -607,6 +607,22 @@ class HFsw(app_manager.RyuApp):
         return lower_policies
 
 
+    def find_lowest_policy_on_link(self, link):
+        lowest = []
+        for r in running_policies:
+            for l in range(len(r[0])-1):
+                if r[0][l] != r[0][0] and r[0][l+1]!= r[0][-1]:
+                    if r[0][l]==link.src.dpid and r[0][l+1] == link.dst.dpid:
+                        lowest.append([r[1].priority, r])
+
+                    elif r[0][l]==link.dst.dpid and r[0][l+1] == link.src.dpid:
+                        lowest.append([r[1].priority, r])
+
+        for low in sorted(lowest):
+            return low[1]
+
+
+
     #Checks a the path for bandwidth and compair it with policy requirements
     def check_path_bandwidth(self, possible_paths, limit):
         bad = []
@@ -712,9 +728,13 @@ class HFsw(app_manager.RyuApp):
                 else:
                     link_bandwidths_ma[link.src.dpid][link.src.port_no] = flowing[1]
 
-                print "Link average on link, SW", link.src.dpid, " to SW",link.dst.dpid, " is ", link_bandwidths_ma[link.src.dpid][link.src.port_no], "ma count", ma
-                print flowing[0]
+                print "Link average on link, SW", link.src.dpid, " to SW ",link.dst.dpid, " is ", link_bandwidths_ma[link.src.dpid][link.src.port_no], "Packet loss", flowing[0]
 
+                #If the controller notifies dropped packets on a used link:
+                if link_bandwidths_ma[link.src.dpid][link.src.port_no] >= 1 and flowing[0] > 0.2:
+                    print "Notifing dropped packets on link SW", link.src.dpid, " to ", " SW", link.dst.dpid, ". Deleting the lowest policy to free bandwidth"
+                    #lowest_policy = self.find_lowest_policy_on_link(link)
+                    #self.policy_deleter(lowest_policy)
 
             if ma < 20:
                 ma = ma+1
@@ -731,38 +751,39 @@ class HFsw(app_manager.RyuApp):
         global old_dst_rxtx_bytes, old_src_rxtx_bytes, old_dst_rxtx_packets, old_src_rxtx_packets
         src_rxtx_bytes = 0
         dst_rxtx_bytes = 0
-        src_rxtx_pkts = 0
-        dst_rxtx_pkts = 0
+        src_tx_pkts = 0
+        dst_rx_pkts = 0
 
 
         for stat in port_status[link.src.dpid]:
             if link.src.port_no == stat.port_no:
                 src_rxtx_bytes = stat.rx_bytes + stat.tx_bytes
-                src_rxtx_pkts = stat.rx_packets + stat.tx_packets
+                src_tx_pkts = stat.tx_packets
 
         for stat in port_status[link.dst.dpid]:
             if link.dst.port_no == stat.port_no:
                 dst_rxtx_bytes = stat.rx_bytes + stat.tx_bytes
-                dst_rxtx_pkts = stat.rx_packets + stat.tx_packets
+                dst_rx_pkts = stat.rx_packets
 
-        if old_src_rxtx_bytes[link.src.dpid][link.src.port_no] is None and old_dst_rxtx_bytes[link.dst.dpid][link.dst.port_no] is None:
+        if old_src_rxtx_bytes[link.src.dpid][link.src.port_no] is None:
             old_src_rxtx_bytes[link.src.dpid][link.src.port_no] = src_rxtx_bytes
             old_dst_rxtx_bytes[link.dst.dpid][link.dst.port_no] = dst_rxtx_bytes
 
-        if old_src_rxtx_packets[link.src.dpid][link.src.port_no] is None and old_dst_rxtx_packets[link.dst.dpid][link.dst.port_no] is None:
-            old_dst_rxtx_packets[link.dst.dpid][link.dst.port_no] = dst_rxtx_pkts
-            old_src_rxtx_packets[link.src.dpid][link.src.port_no] = src_rxtx_pkts
+        if old_src_rxtx_packets[link.src.dpid][link.src.port_no] is None:
+            old_src_rxtx_packets[link.src.dpid][link.src.port_no] = src_tx_pkts
 
-#
-        #
-        #
-        #TODO: Ended here. Fix the dropped packets function
-        #
-        #
+        if old_dst_rxtx_packets[link.dst.dpid][link.dst.port_no] is None:
+                old_dst_rxtx_packets[link.dst.dpid][link.dst.port_no] = dst_rx_pkts
 
+        pkt_sent = float(abs(src_tx_pkts - old_src_rxtx_packets[link.src.dpid][link.src.port_no]))
 
-        pathloss = "LOL"
-        #pathloss = abs((old_src_rxtx_packets[link.src.dpid][link.src.port_no]-old_dst_rxtx_packets[link.dst.dpid][link.dst.port_no]) - (src_rxtx_pkts-dst_rxtx_pkts))
+        pkt_rec = float(abs(dst_rx_pkts - old_dst_rxtx_packets[link.dst.dpid][link.dst.port_no]))
+
+        if pkt_sent == 0 or pkt_rec == 0 or pkt_sent == pkt_rec or pkt_rec > pkt_sent:
+            pathloss = 0.0
+
+        else:
+            pathloss = float("{0:.1f}".format(1-(pkt_rec/pkt_sent)))
 
         old_traffic = (old_src_rxtx_bytes[link.src.dpid][link.src.port_no] + old_dst_rxtx_bytes[link.dst.dpid][link.dst.port_no])
 
@@ -770,8 +791,8 @@ class HFsw(app_manager.RyuApp):
 
         old_src_rxtx_bytes[link.src.dpid][link.src.port_no] = src_rxtx_bytes
         old_dst_rxtx_bytes[link.dst.dpid][link.dst.port_no] = dst_rxtx_bytes
-        old_src_rxtx_packets[link.src.dpid][link.src.port_no] = src_rxtx_pkts
-        old_src_rxtx_packets[link.dst.dpid][link.dst.port_no] = dst_rxtx_pkts
+        old_src_rxtx_packets[link.src.dpid][link.src.port_no] = src_tx_pkts
+        old_dst_rxtx_packets[link.dst.dpid][link.dst.port_no] = dst_rx_pkts
 
         if measure_bandwidth and measure_loss:
             #print traffic, " mbit/s and with packet loss of ", dropped, "the last ", sleeptime, "seconds at link:", link.src.dpid, "-", link.dst.dpid
@@ -888,8 +909,10 @@ class HFsw(app_manager.RyuApp):
         #req = parser.OFPGroupStatsRequest(datapath,0, ofproto.OFPG_ALL,None)
         #datapath.send_msg(req)
 
-# TODO: 2. Move the flows based on observed packet drops
-# TODO: 3. Include more policy settings such as block/delay?
+# TODO: 1 Add traffic classes based on best links
+# TODO: 2 Add more parameters to the policy; strict, elastic etc.
 
-#TODO: FIX create a policy object for running flows which does not have a policy
-#TODO: FIX What happends to a running policy when traffic loading is applied? It needs to be splitted
+# TODO: Look at how to police/throttle the bandwidth. Per-flow meters
+# TODO: Look at queue options
+# TODO: FIX create a policy object for running flows which does not have a policy
+# TODO: FIX What happends to a running policy when traffic loading is applied? It needs to be splitted
