@@ -31,15 +31,15 @@ class Policy(object):
     def get_priority(self):
         return self.priority
 
-    def action(self, idle_timeout=0, hard_timeout=0, random_routing=False, block=False, bandwidth_requirement=0, load_balance=False):
+    def action(self, bandwidth_requirement=0, bandwidth_requirement_strict= False, allow_load_balance=False, random_routing=False, block=False, traffic_class = 0):
 
             self.actions_list = {
-            'idle_timeout': idle_timeout,
-            'hard_timeout': hard_timeout,
+            'bandwidth_requirement': bandwidth_requirement,
+            'bandwidth_requirement_strict': bandwidth_requirement_strict,
+            'allow_load_balance': allow_load_balance,
             'random_routing': random_routing,
             'block': block,
-            'bandwidth_requirement': bandwidth_requirement,
-            'load_balance': load_balance
+            'traffic_class' : traffic_class
             }
 
     def get_actions(self):
