@@ -92,8 +92,9 @@ class HFsw(app_manager.RyuApp):
                         paths = nx.all_shortest_paths(self.net,src,dst)
 
                         #Finds the weakest path, due to a low priority flow.
-                        low_paths = self.calculate_traffic_class(paths)
+                        low_paths = self.calculate_traffic_class(paths,3)
 
+                        print low_paths
                         #Installs flows using queue 1 and saves the flows
                         self.flow_rule_crawler(low_paths[-1][1],"install", True, 1)
                         running_flows.append(low_paths[-1][1])
@@ -248,20 +249,44 @@ class HFsw(app_manager.RyuApp):
                 break
 
         if bw != 0:
-            print "Bandwidth", bw
             bandwidth_requirement = self.bandwidth_checker(src, dst, bw_policy)
 
             #If one path is found
             if len(bandwidth_requirement) is 3:
 
+                traffic_class = 0
+                for match in policy_match:
+                    traffic_class = self.policy_action_fetcher(match, "traffic_class")
+                    if traffic_class != 0:
+                        #Finds the best paths within the approved paths
+                        weighted_paths = self.calculate_traffic_class(bandwidth_requirement[0])
+                        if traffic_class == 1:
+                            weighted_paths = weighted_paths[:2]
+                        elif traffic_class == 3:
+                            weighted_paths = weighted_paths[:2]
+                        else:
+                            weighted_paths = weighted_paths[:1:]
+                        break
+
                 random_routing = False
                 for match in policy_match:
                     random_routing = self.policy_action_fetcher(match, "random_routing")
-                    if random_routing == True:
+                    if random_routing is True:
                         break
 
+                if random_routing is True and bandwidth_requirement is True:
+                    route = random.randint(0,len(weighted_paths)-1)
+                    self.flow_rule_crawler(weighted_paths[route],"install", True, 0)
+
+                    #Saves the policy and the path to the running policy list
+                    running_policies.append([weighted_paths[route], bandwidth_requirement[1]])
+
+                    #Update link-bandwidth
+                    self.update_path_bandwidth(weighted_paths[route], bandwidth_requirement[2])
+
+
                 #If random routing is applied to flow: choose randomly in the path pool
-                if random_routing == True:
+                elif random_routing is True:
                     route = random.randint(0,len(bandwidth_requirement[0])-1)
                     self.flow_rule_crawler(bandwidth_requirement[0][route],"install", True, 0)
 
@@ -683,7 +708,7 @@ class HFsw(app_manager.RyuApp):
 
 
     #Calculate traffic class by adding the links and the bw!
-    def calculate_traffic_class(self, paths):
+    def calculate_traffic_class(self, paths, traffic_class):
         weighted_paths = []
         for path in paths:
             weakest_link = 999
@@ -698,8 +723,23 @@ class HFsw(app_manager.RyuApp):
             #Algorithm to find the best path: Multiply weakest link with the average link bandwidth
             weighted = weakest_link*(path_bw/(len(path)-2))
             weighted_paths.append([weighted, path])
+        print weighted_paths
 
-        return sorted(weighted_paths)
+        if traffic_class == 1:
+            return sorted(weighted_paths)[:2]
+
+        elif traffic_class == 2:
+            return sorted(weighted_paths)[:1:]
+
+        else:
+            return sorted(weighted_paths)[:-2]
+
+
+    #TODO: ####################################################################################################3
+    #TODO: Generate weigthed paths based on the length of the weigthed_path. It must be relative to its size.
+    #TODO: "################################################################################################
+
+
 
 
 
@@ -973,7 +1013,6 @@ class HFsw(app_manager.RyuApp):
                 node.dp.send_msg(mod)
 
 
-
     #Function to send a group rule to a switch based on a list with ports and weights
     def send_group_rule(self, src, dst, sw, port_weight_list, group_id):
         self.src = src
@@ -1013,13 +1052,6 @@ class HFsw(app_manager.RyuApp):
         req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
         datapath.send_msg(req)
 
-
-
-# TODO: 1 Add traffic classes based on best links.
-# TODO: 2 Add more parameters to the policy; strict, elastic etc.
-
-
 # TODO: Look at how to police/throttle the bandwidth. Per-flow meters
-# TODO: Look at queue options
 # TODO: FIX What happends to a running policy when traffic loading is applied? It needs to be splitted
-# TODO: Generate a general block rule. The priority field in flow rules is used to separate wildcard rules! The higher number = higher pri
+# TODO: Generate a general block rule. The priority field in flow rules is used to separate wildcard rules! The higher number = higher priority
