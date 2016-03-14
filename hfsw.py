@@ -40,6 +40,7 @@ class HFsw(app_manager.RyuApp):
         self.topology_api_app = self
         self.net=nx.DiGraph()
         self.monitor_thread = hub.spawn(self._network_monitor)
+        self.ssh_thread = hub.spawn(self._queue_generator)
         self.new_flow_stats = 0
 
         #Executes the policies at initiation
@@ -79,14 +80,23 @@ class HFsw(app_manager.RyuApp):
                     if len(policy_match) is not 0:
                         self.packet_handler(src, dst, policy_match)
                     else:
+                        for running in running_policies:
+                            if (running[0][0] == src and running[0][-1] == dst) or (running[0][0] == dst and running[0][-1] == src):
+                                print "An excisting flow policy is applied for one direction of the flow."
+                                path = nx.shortest_path(self.net,src,dst)
+                                self.flow_rule_crawler(path,"install", True, 0)
+                                return
+
                         print "No policy found"
                         #If no policy is found, use random path.
-                        path = nx.shortest_path(self.net,src,dst)
+                        paths = nx.all_shortest_paths(self.net,src,dst)
 
-                        #Installs flows and saves the flows
-                        self.flow_rule_crawler(path,"install", True)
-                        running_flows.append(path)
-                        #TODO: create a policy object for this!
+                        #Finds the weakest path, due to a low priority flow.
+                        low_paths = self.calculate_traffic_class(paths)
+
+                        #Installs flows using queue 1 and saves the flows
+                        self.flow_rule_crawler(low_paths[-1][1],"install", True, 1)
+                        running_flows.append(low_paths[-1][1])
 
                     #Forwards the ARP response after path is created
                     for running in running_policies:
@@ -158,30 +168,13 @@ class HFsw(app_manager.RyuApp):
         #Generating random link speeds, for simulation purposes
         hub.sleep(0.1)
         for link in links_list:
-            linkspeed = random.randint(20,20)
+            linkspeed = random.randint(10,20)
             if link_bandwidths[link.src.dpid][link.src.port_no] is None and link_bandwidths[link.dst.dpid][link.dst.port_no] is None:
                 link_bandwidths[link.src.dpid][link.src.port_no] = linkspeed
                 link_bandwidths[link.dst.dpid][link.dst.port_no] = linkspeed
                 link_bandwidths_original[link.src.dpid][link.src.port_no] = linkspeed
                 link_bandwidths_original[link.dst.dpid][link.dst.port_no] = linkspeed
                 print "Linkspeed detected: ", link, " speed = ", linkspeed
-
-
-         #Adds queue to each ports
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect('129.241.209.173', username='mininet', password='mininet')
-
-        for switch in switch_list:
-            for port in switch.ports:
-                queuecmd = "sudo ovs-vsctl set port %s qos=@newqos -- --id=@newqos create qos type=linux-htb other-config:max-rate=10000000 queues:0=@q0 -- --id=@q0 create queue other-config:min-rate=10000000 other-config:max-rate=10000000" % port.name
-                #q_res = os.popen(queuecmd).read()
-                ssh.exec_command(queuecmd)
-                #print q_res
-                print queuecmd
-
-    #TODO: Complete this work in order to create a queue for strict requirements and for non-strict bandwidth requirements
-
 
 
     #Add hosts to hosts_list, but only works at initiation
@@ -270,7 +263,7 @@ class HFsw(app_manager.RyuApp):
                 #If random routing is applied to flow: choose randomly in the path pool
                 if random_routing == True:
                     route = random.randint(0,len(bandwidth_requirement[0])-1)
-                    self.flow_rule_crawler(bandwidth_requirement[0][route],"install", True)
+                    self.flow_rule_crawler(bandwidth_requirement[0][route],"install", True, 0)
 
                     #Saves the policy and the path to the running policy list
                     running_policies.append([bandwidth_requirement[0][route], bandwidth_requirement[1]])
@@ -279,11 +272,13 @@ class HFsw(app_manager.RyuApp):
                     self.update_path_bandwidth(bandwidth_requirement[0][route], bandwidth_requirement[2])
 
                 else: #If not; choose the first from the path pool (shortest path) and update the controller.
-                    self.flow_rule_crawler(bandwidth_requirement[0][0],"install", True)
+                    self.flow_rule_crawler(bandwidth_requirement[0][0],"install", True, 0)
 
                     running_policies.append([bandwidth_requirement[0][0], bandwidth_requirement[1]])
 
                     self.update_path_bandwidth(bandwidth_requirement[0][0], bandwidth_requirement[2])
+
+                return
 
             #If paths are found, but traffic loading is needed.
             elif len(bandwidth_requirement) is 2:
@@ -335,7 +330,7 @@ class HFsw(app_manager.RyuApp):
                                     self.send_group_rule(src, dst, first[0][f], group_rule, group_id)
 
                                     #Creates a flowrule linking to the group rule
-                                    self.send_flow_rule_install(src,dst,group_id, first[0][f], "group")
+                                    self.send_flow_rule_install(src,dst,group_id, first[0][f], "group", None)
 
                                     #Saves the group_rule to a list, to prevent creating two copies
                                     group_rules_created.append(first[0][f])
@@ -348,77 +343,84 @@ class HFsw(app_manager.RyuApp):
                                         port = self.find_out_port(first[0][f], first[0][f+1])
 
                                         #Installs flow rule to the switch
-                                        self.send_flow_rule_install(src, dst, port, first[0][f], "port")
+                                        self.send_flow_rule_install(src, dst, port, first[0][f], "port", 0)
 
                                     #Installs flow rule to the host
                                     elif first[0][f+1] == first[0][-1]:
                                         port = self.net[first[0][f]][first[0][f+1]]['port']
-                                        self.send_flow_rule_install(src, dst, port, first[0][f], "port")
-                    break
-
+                                        self.send_flow_rule_install(src, dst, port, first[0][f], "port", None)
+                    return
 
 
             #If no possible paths is found
-            if loadbalance is False:
+            else:
                 #running_policies = [path, policy]
                 print "Link capacity is filled up! Using moving average to get realistic view of flows"
                 possible_paths = nx.all_shortest_paths(self.net, src, dst)
                 ma_path = []
 
-                #TODO: IF IT IS STRICT, LOOP TO SEE IF THERE ARE NON-STRICT RUNNING POLICIES.
-                #TODO: IF IT IS NON-STRICT. ADD
+                non_strict = False
+                for match in policy_match:
+                    non_strict = self.policy_action_fetcher(match, "bandwidth_requirement_strict")
+                    if non_strict == True:
+                        #If the policy is non-strict, try to add it to queue 1.
+                        for p in possible_paths:
+                            flow_count = 0
+                            average_path = 0
+                            average_flow = 0
+                            full_path = 0
 
-                for p in possible_paths:
-                    flow_count = 0
-                    average_path = 0
-                    average_flow = 0
-                    full_path = 0
+                            #Counts the running flows down a specific path
+                            for r in running_policies:
+                                if p ==r[0]:
+                                    flow_count = flow_count+1
 
-                    #Counts the running flows down a specific path
-                    for r in running_policies:
-                        if p ==r[0]:
-                            flow_count = flow_count+1
+                            #Finds average flowing traffic
+                            if flow_count is not 0:
+                                try:
+                                    for path in range(len(p)-1):
+                                        if p[path] != p[0] and p[path+1] != p[-1]:
+                                            port = self.find_out_port(p[path], p[path+1])
+                                            average_path = average_path + link_bandwidths_ma[p[path]][port]
+                                            full_path = full_path + link_bandwidths_original[p[path]][port]
 
-                    #Finds average flowing traffic
-                    if flow_count is not 0:
-                        try:
-                            for path in range(len(p)-1):
-                                if p[path] != p[0] and p[path+1] != p[-1]:
-                                    port = self.find_out_port(p[path], p[path+1])
-                                    average_path = average_path + link_bandwidths_ma[p[path]][port]
-                                    full_path = full_path + link_bandwidths_original[p[path]][port]
+                                    #Average flowing traffic, full link capacity and flowing per-flow
+                                    average_path = average_path/(len(p)-3)
+                                    full_path = full_path/(len(p)-3)
+                                    average_flow = average_path/flow_count
+                                    capacity = full_path - (average_path + average_flow)
 
-                            #Average flowing traffic, full link capacity and flowing per-flow
-                            average_path = average_path/(len(p)-3)
-                            full_path = full_path/(len(p)-3)
-                            average_flow = average_path/flow_count
-                            capacity = full_path - (average_path + average_flow)
+                                    print "Average per flow :", average_flow, "Average per path ", average_path, "Full path bandwidth", full_path, "with remaining capacity ", capacity
 
-                            print "Average per flow :", average_flow, "Average per path ", average_path, "Full path bandwidth", full_path, "with remaining capacity ", capacity
+                                    req = self.policy_action_fetcher(bandwidth_requirement[0],"bandwidth_requirement")
+                                    #If less than half of the link capacity is in use by adding the new flow
+                                    #and the capacity is higher that the policy requirement
 
-                            req = self.policy_action_fetcher(bandwidth_requirement[0],"bandwidth_requirement")
-                            #If less than half of the link capacity is in use by adding the new flow
-                            #and the capacity is higher that the policy requirement
+                                    if capacity >= full_path/2 and capacity >= req:
+                                        ma_path.append([capacity, p])
 
-                            if capacity >= full_path/2 and capacity >= req:
-                                ma_path.append([capacity, p])
+                                except TypeError:
+                                    print "No flow path statistics available: no update yet"
+                                    ma_path = []
 
-                        except TypeError:
-                            print "No flow path statistics available: no update yet"
-                            ma_path = []
+                        if len(ma_path) > 0:
+                            #Sorts by capacity
+                            sorted(ma_path)
+                            for ma in ma_path:
+                                print ma
+                                #Installs the flow in queue 1
+                                self.flow_rule_crawler(ma[1],"install", True, 1)
+                                running_policies.append([ma[1], p])
+                                break
+                        else:
+                            non_strict = False
 
-                if len(ma_path) > 0:
-                    #Sorts by capacity
-                    sorted(ma_path)
-                    for ma in ma_path:
-                        print ma
-                        self.flow_rule_crawler(ma[1],"install", True)
-                        running_policies.append([ma[1], p])
-                        break
+                    break
 
-                else:
+                #If the policy is strict
+                if non_strict is False:
                     #lower_policies = priority and path
-                    print "No possible paths. Trying to move policies!"
+                    print "No possible paths. Trying to delete lower policies!"
                     possible_paths = nx.all_shortest_paths(self.net, src, dst)
 
                     #For every policy, check if there are lower policies using the same path
@@ -448,12 +450,10 @@ class HFsw(app_manager.RyuApp):
             print "No bandwidth requirements"
 
 
-
     def _send_packet(self, datapath, port, pkt):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         pkt.serialize()
-        #self.logger.info("packet-out %s" % (pkt,))
         data = pkt.data
         actions = [parser.OFPActionOutput(port=port)]
         out = parser.OFPPacketOut(datapath=datapath,
@@ -604,9 +604,9 @@ class HFsw(app_manager.RyuApp):
                             remove.append(r)
 
                             #Deletes the whole path in both directions!
-                            self.flow_rule_crawler(lower_policy[0], "delete", True)
+                            self.flow_rule_crawler(lower_policy[0], "delete", True, None)
 
-                            self.flow_rule_crawler(lower_policy[0], "delete", False)
+                            self.flow_rule_crawler(lower_policy[0], "delete", False, None)
 
                             #Update the link bandwidths:
                             for node in range(len(lower_policy[0])-1):
@@ -665,6 +665,41 @@ class HFsw(app_manager.RyuApp):
 
         for low in sorted(lowest):
             return low[1]
+        else:
+            return 0
+
+
+    def find_non_policies_on_link(self, link):
+        running = []
+        for r in running_flows:
+            for l in range(len(r[0])-1):
+                if r[l] != r[0] and r[l+1]!= r[-1]:
+                    if r[l]==link.src.dpid and r[l+1] == link.dst.dpid:
+                        running.append(r)
+
+                    elif r[l]==link.dst.dpid and r[l+1] == link.src.dpid:
+                        running.append(r)
+        return running
+
+
+    #Calculate traffic class by adding the links and the bw!
+    def calculate_traffic_class(self, paths):
+        weighted_paths = []
+        for path in paths:
+            weakest_link = 999
+            path_bw = 0
+            for node in range(len(path)-1):
+                if path[node] != path[0] and path[node+1] != path[-1]:
+                    port = self.find_out_port(path[node], path[node+1])
+                    path_bw = path_bw + link_bandwidths_original[path[node]][port]
+                    if weakest_link > link_bandwidths_original[path[node]][port]:
+                        weakest_link = link_bandwidths_original[path[node]][port]
+
+            #Algorithm to find the best path: Multiply weakest link with the average link bandwidth
+            weighted = weakest_link*(path_bw/(len(path)-2))
+            weighted_paths.append([weighted, path])
+
+        return sorted(weighted_paths)
 
 
 
@@ -709,7 +744,7 @@ class HFsw(app_manager.RyuApp):
 
 
     #Iterate through flow tables based on path and action. Action is install or delete flow rules
-    def flow_rule_crawler(self, path, action, reverse):
+    def flow_rule_crawler(self, path, action, reverse, queue):
 
         if reverse:
             path = path[::-1]
@@ -720,10 +755,10 @@ class HFsw(app_manager.RyuApp):
         try:
             out_port= self.net[path[1]][mac_dst]['port']
             if action == "install":
-                self.send_flow_rule_install(mac_src, mac_dst, out_port, path[1], "port")
+                self.send_flow_rule_install(mac_src, mac_dst, out_port, path[1], "port", None)
 
             elif action == "delete":
-                self.send_flow_rule_delete(mac_src, mac_dst, out_port, path[1], "port")
+                self.send_flow_rule_delete(mac_src, mac_dst, out_port, path[1], "port", None)
 
         except KeyError:
             print "Error creating source flow rules"
@@ -735,10 +770,10 @@ class HFsw(app_manager.RyuApp):
                     if node+2 < (len(path)-1) and l.src.dpid == path[node+2] and l.dst.dpid == path[node+1]:
                         out_port = l.src.port_no
                         if action == "install":
-                            self.send_flow_rule_install(mac_src, mac_dst, out_port, path[node+2], "port")
+                            self.send_flow_rule_install(mac_src, mac_dst, out_port, path[node+2], "port", queue)
 
                         elif action == "delete":
-                            self.send_flow_rule_delete(mac_src, mac_dst, out_port, path[node+2],"port")
+                            self.send_flow_rule_delete(mac_src, mac_dst, out_port, path[node+2],"port", queue)
 
                 except IndexError:
                     print "Iterating function out of range"
@@ -777,9 +812,19 @@ class HFsw(app_manager.RyuApp):
 
                 #If the controller notifies dropped packets on a used link:
                 if link_bandwidths_ma[link.src.dpid][link.src.port_no] >= 1 and flowing[0] > 0.2:
-                    print "Notifing dropped packets on link SW", link.src.dpid, " to ", " SW", link.dst.dpid, ". Deleting the lowest policy to free bandwidth"
-                    #lowest_policy = self.find_lowest_policy_on_link(link)
-                    #self.policy_deleter(lowest_policy)
+
+                    #If we have running flows without any policies attatched, remove to prioritize non-strict policies
+                    non_policies = self.find_non_policies_on_link(link)
+                    if non_policies is not None or non_policies is not 0:
+                        for np in non_policies:
+                            self.flow_rule_crawler(np, "delete", False, None)
+                            self.flow_rule_crawler(np, "delete", True, None)
+
+                    else:
+                        lowest_policy = self.find_lowest_policy_on_link(link)
+                        if lowest_policy is not 0:
+                            print "Notifing dropped packets on link SW", link.src.dpid, " to ", " SW", link.dst.dpid, ". Deleting the lowest policy to free bandwidth"
+                            self.policy_deleter(lowest_policy)
 
             if ma < 20:
                 ma = ma+1
@@ -789,6 +834,27 @@ class HFsw(app_manager.RyuApp):
                 #Clears blocked src-dst pairs
                 dropped.clear()
             hub.sleep(sleeptime)
+
+
+    def _queue_generator(self):
+        #Adds two QoS queues to each port, ensuring that strict policies are added to q0 and non-strict to q1
+        hub.sleep(2)
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect('129.241.209.173', username='mininet', password='mininet')
+
+        for switch in switch_list:
+            for port in switch.ports:
+                for link in links_list:
+                    if link.src.dpid == switch.dp.id and port.port_no == link.src.port_no:
+                        link_bw = (link_bandwidths[link.src.dpid][link.src.port_no]*1000000)
+                        queuecmd = "sudo ovs-vsctl set port %s qos=@newqos -- --id=@newqos create qos type=linux-htb other-config:max-rate=%s queues:0=@q0,1=@q1 -- " \
+                                   "--id=@q0 create queue other-config:min-rate=%s other-config:max-rate=%s --" \
+                                   "--id=@q1 create queue other-config:max-rate=%s" \
+                                   % (port.name,link_bw, link_bw, link_bw, link_bw)
+                        ssh.exec_command(queuecmd)
+                        print queuecmd
+
 
 
     #Iterating function to inspect a given link for packet loss and transmitting traffic
@@ -857,7 +923,7 @@ class HFsw(app_manager.RyuApp):
 
 
     #Function to send a flow rule to a switch
-    def send_flow_rule_install(self,src, dst, out_port, sw, action):
+    def send_flow_rule_install(self,src, dst, out_port, sw, action, queue):
         print "Installing flow rule on :", sw, "Match conditions: eth_src =  ", src, " and eth_dst = ", dst, ". Action: out_port =  ", out_port
         hard_timeout = 0
 
@@ -865,13 +931,14 @@ class HFsw(app_manager.RyuApp):
             if node.dp.id == sw:
                 ofp_parser = node.dp.ofproto_parser
                 hard_timeout = 0
-                if action == "port":
-                    actions = [ofp_parser.OFPActionOutput(port=out_port)]
+                if action == "port" and queue is not None:
+                    actions = [ofp_parser.OFPActionSetQueue(queue), ofp_parser.OFPActionOutput(out_port)]
+
+                if action == "port" and queue is None:
+                    actions = [ofp_parser.OFPActionOutput(out_port)]
+
                 if action == "group":
                     actions = [ofp_parser.OFPActionGroup(out_port)]
-                if action == "drop":
-                    actions = [ofp_parser.OFPActionOutput()]
-                    hard_timeout = 30
 
                 match = node.dp.ofproto_parser.OFPMatch(eth_src=src, eth_dst=dst)
                 inst = [ofp_parser.OFPInstructionActions(ofproto_v1_3.OFPIT_APPLY_ACTIONS, actions)]
@@ -951,8 +1018,8 @@ class HFsw(app_manager.RyuApp):
 # TODO: 1 Add traffic classes based on best links.
 # TODO: 2 Add more parameters to the policy; strict, elastic etc.
 
+
 # TODO: Look at how to police/throttle the bandwidth. Per-flow meters
 # TODO: Look at queue options
-# TODO: FIX create a policy object for running flows which does not have a policy
 # TODO: FIX What happends to a running policy when traffic loading is applied? It needs to be splitted
 # TODO: Generate a general block rule. The priority field in flow rules is used to separate wildcard rules! The higher number = higher pri
