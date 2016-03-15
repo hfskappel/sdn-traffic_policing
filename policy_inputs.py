@@ -13,6 +13,7 @@
 # block : Blocks the flow
 # traffic_class : What traffic class the flow should use, based on the links bandwidths. 1-3 where 1 is the best class
 # random_routing: Applies random routing of the flow
+###########################################################
 
 
 
@@ -29,7 +30,7 @@ def generate_policies():
 
     policy002 = policy_manager.Policy()
     policy002.match(ip_src="10.10.10.104")
-    policy002.action(bandwidth_requirement=2)
+    policy002.action(bandwidth_requirement=2, traffic_class=1, random_routing=True)
     policy002.priority(3)
 
     policy003 = policy_manager.Policy()
