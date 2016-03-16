@@ -46,7 +46,6 @@ class HFsw(app_manager.RyuApp):
         global policy_list
         policy_list=generate_policies()
 
-
     #Listens for incoming packets to the controller
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
@@ -83,7 +82,7 @@ class HFsw(app_manager.RyuApp):
                             if (running[0][0] == src and running[0][-1] == dst) or (running[0][0] == dst and running[0][-1] == src):
                                 print "An excisting flow policy is applied for oposite direction of the flow."
                                 path = nx.shortest_path(self.net,src,dst)
-                                self.flow_rule_crawler(path,"install", True, 0)
+                                self.flow_rule_crawler_install(path,True, 0)
                                 return
 
                         print "No policy found"
@@ -93,22 +92,23 @@ class HFsw(app_manager.RyuApp):
                         #Finds the weakest path, due to a low priority flow.
                         low_paths = self.calculate_traffic_class(paths,3)
 
-                        #Installs flows using queue 1 and saves the flows
-                        self.flow_rule_crawler(low_paths[-1][1],"install", True, 1)
                         if low_paths[-1][1] not in running_flows:
                             running_flows.append(low_paths[-1][1])
 
+                            #Installs flows using queue 1 and saves the flows
+                            self.flow_rule_crawler_install(low_paths[-1][1], True, 1)
+
                     #Forwards the ARP response after path is created
-                    for running in running_policies:
-                        if running[0][-1] == dst and dropped[src][dst] is None:
-                            for node in switch_list:
-                                if running[0][-2] == node.dp.id:
-                                    port = self.net[running[0][-2]][dst]['port']
-                                    actions = [ofp_parser.OFPActionOutput(port=port)]
-                                    out = ofp_parser.OFPPacketOut(datapath=node.dp, buffer_id=0xffffffff, in_port=in_port, actions=actions, data=msg.data)
-                                    node.dp.send_msg(out)
-                                    print "ARP reply forwarded on sw:", node.dp.id, " out port: ", port
-                                    break
+                    #for running in running_policies:
+                     #    if running[0][-1] == dst and dropped[src][dst] is None:
+                      #      for node in switch_list:
+                       #         if running[0][-2] == node.dp.id:
+                        #            port = self.net[running[0][-2]][dst]['port']
+                        #            actions = [ofp_parser.OFPActionOutput(port=port)]
+                        #            out = ofp_parser.OFPPacketOut(datapath=node.dp, buffer_id=0xffffffff, in_port=in_port, actions=actions, data=msg.data)
+                        #            node.dp.send_msg(out)
+                        #            print "ARP reply forwarded on sw:", node.dp.id, " out port: ", port
+                        #            break
 
                 except nx.NetworkXNoPath:
                     print "Could not create flow path"
@@ -147,7 +147,7 @@ class HFsw(app_manager.RyuApp):
     #Listens for connecting switches (ConnectionUp)
     @set_ev_cls(event.EventSwitchEnter)
     def get_topology_data(self, ev):
-        global links, switch_list, links_list
+        global switch_list, links_list
         switch_list = get_switch(self.topology_api_app, None)
         switches=[switch.dp.id for switch in switch_list]
         links_list = get_link(self.topology_api_app, None)
@@ -176,20 +176,25 @@ class HFsw(app_manager.RyuApp):
                 link_bandwidths_original[link.dst.dpid][link.dst.port_no] = linkspeed
                 print "Link capacity detected: ", link, " speed = ", linkspeed
 
-    #Add hosts to hosts_list, but only works at initiation
-    @set_ev_cls(event.EventHostAdd)
-    def get_host_data(self, ev):
-        hosts_list = get_host(self.topology_api_app, None)
 
-
-    #Detects new links
+     #Detects new links
     @set_ev_cls(event.EventLinkAdd)
     def _event_link_add_handler(self, ev):
         global links
         link = ev.link
         links.append((link.src.dpid,link.dst.dpid,{'port':link.src.port_no}))
-        #print "Link discovered between sw:", link.src.dpid, " and sw:", link.dst.dpid, ". Total number of active links: ",len(links_list)/2
         self.net.add_edges_from(links)
+
+        if link_bandwidths[link.src.dpid][link.src.port_no] is not None:
+            link_bandwidths[link.src.dpid][link.src.port_no] = link_bandwidths_original[link.src.dpid][link.src.port_no]
+            print "Link capacity detected: ", link, " speed = ", link_bandwidths[link.src.dpid][link.src.port_no]
+
+        else:
+            linkspeed = random.randint(10,20)
+            link_bandwidths[link.src.dpid][link.src.port_no] = linkspeed
+            link_bandwidths_original[link.src.dpid][link.src.port_no] = linkspeed
+            print "Link capacity detected: ", link, " speed = ", linkspeed
+
 
     @set_ev_cls(event.EventLinkDelete)
     def _event_link_delete_handler(self, ev):
@@ -200,13 +205,37 @@ class HFsw(app_manager.RyuApp):
             elif l[0] == link.dst.dpid and l[1] == link.src.dpid:
                 links.pop(links.index(l))
 
-        print "Link disconnected between sw:", link.src.dpid, " and sw:", link.dst.dpid, ". Total number of active links: ",len(links_list)/2
-        #TODO: Rerouting prosedure
+        link_bandwidths[link.src.dpid][link.src.port_no] = link_bandwidths_original[link.src.dpid][link.src.port_no]
+        print "[LINK FAILURE] Link bandwidths updated on link connecting sw:",link.src.dpid, " and sw:", link.dst.dpid, " with capasity ", link_bandwidths[link.src.dpid][link.src.port_no]
+
+        try:
+            self.net.remove_edge(link.src.dpid, link.dst.dpid)
+
+        except nx.NetworkXError:
+            print "Link already deleted!"
+
+        #Iterating over running policies to see if any are using the disconnected link. Delete it if it does.
+        for running_policy in running_policies:
+            for node in range(len(running_policy[0])-1):
+                if running_policy[0][node] != running_policy[0][0] and running_policy[0][node+1] != running_policy[0][-1]:
+                    if running_policy[0][node] == link.src.dpid and running_policy[0][node+1] == link.dst.dpid:
+                        #Deletes the policy from the toal path and updates link bandwidths
+                        self.policy_deleter(running_policy)
+
+        #Iterating over the best-effort flows to see if any are using the disconnected link. Delete it if it does.
+        for running_flow in running_flows:
+            for node in range(len(running_flow)-1):
+                if running_flow[node] != running_flow[0] and running_flow[node+1] != running_flow[-1]:
+                    if running_flow[node] == link.src.dpid and running_flow[node+1] == link.dst.dpid:
+
+                        #Removing flows and update the controller
+                        running_flows.pop(running_flows.index(running_flow))
+                        self.flow_rule_crawler_delete(running_flow, True)
 
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def _port_stats_reply_handler(self, ev):
 
-        #Adding the port information to a global list
+        #Adding the port information to a global list, used for traffic measurements
         global port_status
         port_status[ev.msg.datapath.id] = ev.msg.body
 
@@ -226,19 +255,19 @@ class HFsw(app_manager.RyuApp):
         if len(remove) > 0:
             for pop in remove:
                 running_policies.pop(pop)
+                return
 
-        else:
-            index = 0
-            for flow in running_flows:
-                if (flow[0] == ev.msg.match['eth_src'] and flow[-1] == ev.msg.match['eth_dst']):
-                    remove.append(index)
-                    print "Flow without policy timed out"
-                index = index+1
+        index = 0
+        for flow in running_flows:
+            if (flow[0] == ev.msg.match['eth_src'] and flow[-1] == ev.msg.match['eth_dst']):
+                remove.append(index)
+                print "Flow without policy timed out"
+            index = index+1
 
-            if len(remove) > 0:
-                for pop in remove:
-                    running_flows.pop(pop)
-
+        if len(remove) > 0:
+            for pop in remove:
+                running_flows.pop(pop)
+                return
 
 ################ CUSTOM FUNCTIONS ######################################################################################
 
@@ -279,25 +308,25 @@ class HFsw(app_manager.RyuApp):
                 #If random routing and traffic class is applied to flow: choose randomly in the traffic class pool
                 if random_routing is True and traffic_class is not 0:
                     route = random.randint(0,len(weighted_paths)-1)
-                    self.flow_rule_crawler(weighted_paths[route][1],"install", True, 0)
+                    self.flow_rule_crawler_install(weighted_paths[route][1], True, 0)
                     running_policies.append([weighted_paths[route][1], bandwidth_requirement[1]])
                     self.update_path_bandwidth(weighted_paths[route][1], bandwidth_requirement[2], True)
 
                 #If random routing is applied to flow: choose randomly in the path pool
                 elif random_routing is True and traffic_class is 0:
                     route = random.randint(0,len(bandwidth_requirement[0])-1)
-                    self.flow_rule_crawler(bandwidth_requirement[0][route],"install", True, 0)
+                    self.flow_rule_crawler_install(bandwidth_requirement[0][route], True, 0)
                     running_policies.append([bandwidth_requirement[0][route], bandwidth_requirement[1]])
                     self.update_path_bandwidth(bandwidth_requirement[0][route], bandwidth_requirement[2], True)
 
                 #If traffic class is applied to flow, but no randomess, choose the best path.
                 elif traffic_class is not 0 and random_routing is False:
-                    self.flow_rule_crawler(weighted_paths[0][1],"install", True, 0)
+                    self.flow_rule_crawler_install(weighted_paths[0][1], True, 0)
                     running_policies.append([weighted_paths[0][1], bandwidth_requirement[1]])
                     self.update_path_bandwidth(weighted_paths[0][1], bandwidth_requirement[2], True)
 
                 else: #If nothing; choose the first from the path pool (shortest path) and update the controller.
-                    self.flow_rule_crawler(bandwidth_requirement[0][0],"install", True, 0)
+                    self.flow_rule_crawler_install(bandwidth_requirement[0][0], True, 0)
                     running_policies.append([bandwidth_requirement[0][0], bandwidth_requirement[1]])
                     self.update_path_bandwidth(bandwidth_requirement[0][0], bandwidth_requirement[2], True)
 
@@ -429,7 +458,7 @@ class HFsw(app_manager.RyuApp):
                             for ma in ma_path:
                                 print ma
                                 #Installs the flow in queue 1 (non-qos)
-                                self.flow_rule_crawler(ma[1],"install", True, 1)
+                                self.flow_rule_crawler_install(ma[1], True, 1)
                                 running_policies.append([ma[1], p])
                                 break
                         else:
@@ -619,28 +648,31 @@ class HFsw(app_manager.RyuApp):
 
                     #Removes the policy from the running list
                     for r in range(len(running_policies)):
-                        print len(running_policies)
                         if running_policies[r] == lower_policy:
                             remove.append(r)
 
                             #Deletes the whole path in both directions!
-                            self.flow_rule_crawler(lower_policy[0], "delete", True, None)
+                            self.flow_rule_crawler_delete(lower_policy[0], True)
 
-                            self.flow_rule_crawler(lower_policy[0], "delete", False, None)
+                            self.flow_rule_crawler_delete(lower_policy[0], False)
 
                             #Update the link bandwidths:
                             for node in range(len(lower_policy[0])-1):
                                 if lower_policy[0][node] != lower_policy[0][0] and lower_policy[0][node+1] != lower_policy[0][-1]:
 
                                     #Update path bandwidth in both directions
-                                    port1 = self.find_out_port(lower_policy[0][node], lower_policy[0][node+1])
-                                    link_bandwidths[lower_policy[0][node]][port1] = link_bandwidths[lower_policy[0][node]][port1] + value
+                                    try:
+                                        port1 = self.find_out_port(lower_policy[0][node], lower_policy[0][node+1])
+                                        link_bandwidths[lower_policy[0][node]][port1] = link_bandwidths[lower_policy[0][node]][port1] + value
 
-                                    port2 = self.find_out_port(lower_policy[0][node+1], lower_policy[0][node])
-                                    link_bandwidths[lower_policy[0][node+1]][port2] = link_bandwidths[lower_policy[0][node+1]][port2] + value
+                                        port2 = self.find_out_port(lower_policy[0][node+1], lower_policy[0][node])
+                                        link_bandwidths[lower_policy[0][node+1]][port2] = link_bandwidths[lower_policy[0][node+1]][port2] + value
 
-                                    print "[POLICY DELETER] Link bandwidths updated on link connecting sw:",lower_policy[0][node], " and sw:",lower_policy[0][node+1], " with capasity ", link_bandwidths[lower_policy[0][node]][port1]
-                                    print "[POLICY DELETER] Link bandwidths updated on link connecting sw:",lower_policy[0][node+1], " and sw:",lower_policy[0][node], " with capasity ", link_bandwidths[lower_policy[0][node+1]][port2]
+                                        print "[POLICY DELETER] Link bandwidths updated on link connecting sw:",lower_policy[0][node], " and sw:",lower_policy[0][node+1], " with capasity ", link_bandwidths[lower_policy[0][node]][port1]
+                                        print "[POLICY DELETER] Link bandwidths updated on link connecting sw:",lower_policy[0][node+1], " and sw:",lower_policy[0][node], " with capasity ", link_bandwidths[lower_policy[0][node+1]][port2]
+
+                                    except TypeError:
+                                        print "Disconnected link removed "
 
                     try:
                         for pop in remove:
@@ -787,20 +819,15 @@ class HFsw(app_manager.RyuApp):
 
 
     #Iterate through flow tables based on path and action. Action is install or delete flow rules
-    def flow_rule_crawler(self, path, action, reverse, queue):
+    def flow_rule_crawler_install(self, path, reverse, queue):
         if reverse:
             path = path[::-1]
-
         mac_src=path[-1]
         mac_dst=path[0]
 
         try:
             out_port= self.net[path[1]][mac_dst]['port']
-            if action == "install":
-                self.send_flow_rule_install(mac_src, mac_dst, out_port, path[1], "port", None)
-
-            elif action == "delete":
-                self.send_flow_rule_delete(mac_src, mac_dst, out_port, path[1], "port", None)
+            self.send_flow_rule_install(mac_src, mac_dst, out_port, path[1], "port", None)
 
         except KeyError:
             print "Error creating source flow rules"
@@ -811,14 +838,21 @@ class HFsw(app_manager.RyuApp):
                 try:
                     if node+2 < (len(path)-1) and l.src.dpid == path[node+2] and l.dst.dpid == path[node+1]:
                         out_port = l.src.port_no
-                        if action == "install":
-                            self.send_flow_rule_install(mac_src, mac_dst, out_port, path[node+2], "port", queue)
-
-                        elif action == "delete":
-                            self.send_flow_rule_delete(mac_src, mac_dst, out_port, path[node+2],"port", queue)
+                        self.send_flow_rule_install(mac_src, mac_dst, out_port, path[node+2], "port", queue)
 
                 except IndexError:
                     print "Iterating function out of range"
+
+
+    def flow_rule_crawler_delete(self, path, reverse):
+        if reverse:
+            path = path[::-1]
+        src = path[0]
+        dst = path[-1]
+
+        for node in range(len(path)-1):
+                    if path[node] != src and path[node] != dst:
+                        self.send_flow_rule_delete(src, dst, None, path[node],"port")
 
 
     #Returns the action value
@@ -857,8 +891,8 @@ class HFsw(app_manager.RyuApp):
                     if non_policies is not None or non_policies is not 0:
                         print "Dropped packets detected on link SW", link.src.dpid, " to ", " SW", link.dst.dpid, ". Deleting non-policy flows to free bandwidth"
                         for np in non_policies:
-                            self.flow_rule_crawler(np, "delete", False, None)
-                            self.flow_rule_crawler(np, "delete", True, None)
+                            self.flow_rule_crawler_delete(np, False)
+                            self.flow_rule_crawler_delete(np, True)
 
                     else:
                         lowest_policy = self.find_lowest_policy_on_link(link)
@@ -886,8 +920,10 @@ class HFsw(app_manager.RyuApp):
         hub.sleep(2)
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        #ssh.connect('129.241.209.173', username='mininet', password='mininet')
-        ssh.connect('192.168.1.33', username='mininet', password='mininet')
+        ssh.connect('129.241.209.173', username='mininet', password='mininet')
+        #ssh.connect('192.168.1.33', username='mininet', password='mininet')
+        #ssh.connect('192.168.38.112', username='mininet', password='mininet')
+
 
         for switch in switch_list:
             for port in switch.ports:
@@ -987,7 +1023,7 @@ class HFsw(app_manager.RyuApp):
 
                 match = node.dp.ofproto_parser.OFPMatch(eth_src=src, eth_dst=dst)
                 inst = [ofp_parser.OFPInstructionActions(ofproto_v1_3.OFPIT_APPLY_ACTIONS, actions)]
-                mod = node.dp.ofproto_parser.OFPFlowMod(datapath=node.dp, match=match, cookie=0, command=ofproto_v1_3.OFPFC_ADD, idle_timeout=10, hard_timeout=hard_timeout,priority=100, instructions=inst, flags=ofproto_v1_3.OFPFF_SEND_FLOW_REM)
+                mod = node.dp.ofproto_parser.OFPFlowMod(datapath=node.dp, match=match, cookie=0, command=ofproto_v1_3.OFPFC_ADD, idle_timeout=30, hard_timeout=hard_timeout,priority=100, instructions=inst, flags=ofproto_v1_3.OFPFF_SEND_FLOW_REM)
                 node.dp.send_msg(mod)
 
 
@@ -1003,7 +1039,7 @@ class HFsw(app_manager.RyuApp):
                 node.dp.send_msg(mod)
 
 
-    def send_flow_rule_delete(self,src, dst, out_port, sw, action):
+    def send_flow_rule_delete(self, src, dst, out_port, sw, action):
         print "Deleting flow rule on :", sw, "Match conditions: eth_src =  ", src, " and eth_dst = ", dst, ". Action: out_port/group =  ", out_port
         for node in switch_list:
 
@@ -1016,7 +1052,6 @@ class HFsw(app_manager.RyuApp):
                     mod = node.dp.ofproto_parser.OFPFlowMod(atapath=node.dp, match=match, command=ofproto_v1_3.OFPFC_DELETE, out_port=ofproto_v1_3.OFPP_ANY, out_group=out_port, buffer_id=ofproto_v1_3.OFP_NO_BUFFER)
 
                 node.dp.send_msg(mod)
-
 
     #Function to send a group rule to a switch based on a list with ports and weights
     def send_group_rule(self, src, dst, sw, port_weight_list, group_id):
@@ -1055,3 +1090,6 @@ class HFsw(app_manager.RyuApp):
         #Sends a Port_Stats_Request
         req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
         datapath.send_msg(req)
+
+# TODO: Add block as a policy parameter
+# TODO: Re-routing when a link goes down
