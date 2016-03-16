@@ -39,7 +39,7 @@ class HFsw(app_manager.RyuApp):
         self.topology_api_app = self
         self.net=nx.DiGraph()
         self.monitor_thread = hub.spawn(self._network_monitor)
-        self.ssh_thread = hub.spawn(self._queue_generator)
+        self.ssh_thread = hub.spawn(self._queue_class_generator)
         self.new_flow_stats = 0
 
         #Executes the policies at initiation
@@ -116,8 +116,7 @@ class HFsw(app_manager.RyuApp):
                 print "No path found between ", src, " and ", dst
 
         else:
-            #Iterates over the switches and sends ARP requests on all ports, except links connecting other switches.
-            #(In order to avoid arp broadcast loops).
+            #Iterates over the switches and sends ARP requests on all ports, except links connecting other switches. (In order to avoid arp broadcast loops).
             pkt_arp = pkt.get_protocol(arp.arp)
 
             if pkt_arp:
@@ -194,7 +193,6 @@ class HFsw(app_manager.RyuApp):
             link_bandwidths[link.src.dpid][link.src.port_no] = linkspeed
             link_bandwidths_original[link.src.dpid][link.src.port_no] = linkspeed
             print "Link capacity detected: ", link, " speed = ", linkspeed
-
 
     @set_ev_cls(event.EventLinkDelete)
     def _event_link_delete_handler(self, ev):
@@ -279,31 +277,38 @@ class HFsw(app_manager.RyuApp):
         #bandwidth_requirement = [policy] (no path found)
         #bandwidth_requirement = 0
 
+        bw_req = False
         for match in policy_match:
-            bw = self.policy_action_fetcher(match, "bandwidth_requirement")
-            if bw != 0:
-                bw_policy = match
-                break
+            block = self.policy_action_fetcher(match, "block")
+            if block is True:
+                possible_paths = nx.all_shortest_paths(self.net, src, dst)
+                for p in possible_paths:
+                    self.send_flow_rule_drop(p[0], p[-1], p[1])
+                    self.send_flow_rule_drop(p[-1], p[-0], p[-2])
+
+                    return
+
+            if bw_req is False:
+                bw = self.policy_action_fetcher(match, "bandwidth_requirement")
+                if bw != 0:
+                    bw_policy = match
+                    bw_req = True
 
         if bw != 0:
             bandwidth_requirement = self.bandwidth_checker(src, dst, bw_policy)
 
             #If one path is found
             if len(bandwidth_requirement) is 3:
-
                 traffic_class = 0
-                for match in policy_match:
-                    traffic_class = self.policy_action_fetcher(match, "traffic_class")
-                    if traffic_class != 0:
-                        #Finds the best paths within the approved paths
-                        weighted_paths = self.calculate_traffic_class(bandwidth_requirement[0], traffic_class)
-                        break
-
                 random_routing = False
                 for match in policy_match:
-                    random_routing = self.policy_action_fetcher(match, "random_routing")
-                    if random_routing is True:
-                        break
+                    if random_routing == False:
+                        random_routing = self.policy_action_fetcher(match, "random_routing")
+                    if traffic_class is 0:
+                        traffic_class = self.policy_action_fetcher(match, "traffic_class")
+                        if traffic_class != 0:
+                            #Finds the best paths within the approved paths
+                            weighted_paths = self.calculate_traffic_class(bandwidth_requirement[0], traffic_class)
 
                 #If random routing and traffic class is applied to flow: choose randomly in the traffic class pool
                 if random_routing is True and traffic_class is not 0:
@@ -490,10 +495,6 @@ class HFsw(app_manager.RyuApp):
                     self.logger.info("Packet %s to %s",src, dst)
                     dropped[src][dst] = True
 
-                    #possible_paths = nx.all_shortest_paths(self.net, src, dst)
-                    #for p in possible_paths:
-                        #self.send_flow_rule_drop(p[-1], p[0], p[-2])
-                        #break
 
         else:
             print "No bandwidth requirements"
@@ -915,7 +916,7 @@ class HFsw(app_manager.RyuApp):
             hub.sleep(sleeptime)
 
 
-    def _queue_generator(self):
+    def _queue_class_generator(self):
         #Adds two QoS queues to each port, ensuring that strict policies are added to q0 and non-strict to q1
         hub.sleep(2)
         ssh = paramiko.SSHClient()
@@ -923,7 +924,6 @@ class HFsw(app_manager.RyuApp):
         ssh.connect('129.241.209.173', username='mininet', password='mininet')
         #ssh.connect('192.168.1.33', username='mininet', password='mininet')
         #ssh.connect('192.168.38.112', username='mininet', password='mininet')
-
 
         for switch in switch_list:
             for port in switch.ports:
@@ -936,7 +936,6 @@ class HFsw(app_manager.RyuApp):
                                    % (port.name,link_bw, link_bw, link_bw, link_bw)
                         ssh.exec_command(queuecmd)
                         print queuecmd
-
 
     #Iterating function to inspect a given link for packet loss and transmitting traffic
     def check_link(self, link, measure_loss, measure_bandwidth):
@@ -999,19 +998,15 @@ class HFsw(app_manager.RyuApp):
             return traffic
 
 
-
 ################ OPENFLOW MESSAGE FUNCTIONS ############################################################################
-
 
     #Function to send a flow rule to a switch
     def send_flow_rule_install(self,src, dst, out_port, sw, action, queue):
         print "Installing flow rule on :", sw, "Match conditions: eth_src =  ", src, " and eth_dst = ", dst, ". Action: out_port =  ", out_port
-        hard_timeout = 0
 
         for node in switch_list:
             if node.dp.id == sw:
                 ofp_parser = node.dp.ofproto_parser
-                hard_timeout = 0
                 if action == "port" and queue is not None:
                     actions = [ofp_parser.OFPActionSetQueue(queue), ofp_parser.OFPActionOutput(out_port)]
 
@@ -1023,7 +1018,7 @@ class HFsw(app_manager.RyuApp):
 
                 match = node.dp.ofproto_parser.OFPMatch(eth_src=src, eth_dst=dst)
                 inst = [ofp_parser.OFPInstructionActions(ofproto_v1_3.OFPIT_APPLY_ACTIONS, actions)]
-                mod = node.dp.ofproto_parser.OFPFlowMod(datapath=node.dp, match=match, cookie=0, command=ofproto_v1_3.OFPFC_ADD, idle_timeout=30, hard_timeout=hard_timeout,priority=100, instructions=inst, flags=ofproto_v1_3.OFPFF_SEND_FLOW_REM)
+                mod = node.dp.ofproto_parser.OFPFlowMod(datapath=node.dp, match=match, cookie=0, command=ofproto_v1_3.OFPFC_ADD, idle_timeout=30, hard_timeout=320,priority=100, instructions=inst, flags=ofproto_v1_3.OFPFF_SEND_FLOW_REM)
                 node.dp.send_msg(mod)
 
 
@@ -1034,8 +1029,8 @@ class HFsw(app_manager.RyuApp):
 
         for node in switch_list:
             if node.dp.id == sw:
-                match = node.dp.ofproto_parser.OFPMatch(eth_src=src)
-                mod = node.dp.ofproto_parser.OFPFlowMod(datapath=node.dp, match=match, cookie=0, command=ofproto_v1_3.OFPFC_ADD, hard_timeout=30,priority=2, instructions=[])
+                match = node.dp.ofproto_parser.OFPMatch(eth_src=src, eth_dst=dst)
+                mod = node.dp.ofproto_parser.OFPFlowMod(datapath=node.dp, match=match, cookie=0, command=ofproto_v1_3.OFPFC_ADD, hard_timeout=180,priority=2, instructions=[])
                 node.dp.send_msg(mod)
 
 
@@ -1090,6 +1085,3 @@ class HFsw(app_manager.RyuApp):
         #Sends a Port_Stats_Request
         req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
         datapath.send_msg(req)
-
-# TODO: Add block as a policy parameter
-# TODO: Re-routing when a link goes down
