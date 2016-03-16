@@ -28,8 +28,9 @@ SDN controller used for traffic policing in changing network conditions.
 - The controller is still under development, so expect bugs.
 - Policies can be defined in policy_inputs.py
 - To this date, only bandwidth requirements can be used as a policy requirement
-- 
-#Troubleshooting
+
+
+# Troubleshooting
 - If "[Errno 98] Address already in use" when starting Ryu: use sudo lsof -i:6633 to get pid and kill with sudo kill -9 "pid"
 - If the controller don't get the packets it might be because of already installed flow rules: clean them with the del-flows command
 - If "Waiting for the host's local ARP cache to reset" does not disapear: clear the hosts local arp table
