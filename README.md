@@ -22,8 +22,15 @@ SDN controller used for traffic policing in changing network conditions.
   - sudo ovs-ofctl -O OpenFlow13 dump-flows s1 - Dump flow rules on switch 1
   - sudo ovs-ofctl -O OpenFlow13 del-groups s1 - Delete group tables on switch 1
   - sudo ovs-ofctl -O OpenFlow13 dump-groups s1 - Dump group rules on switch 1
+  - ip -s -s neigh flush all - Flush a hosts arp-table
 
 # The controller
 - The controller is still under development, so expect bugs.
 - Policies can be defined in policy_inputs.py
 - To this date, only bandwidth requirements can be used as a policy requirement
+
+
+# Troubleshooting
+- If "[Errno 98] Address already in use" when starting Ryu: use sudo lsof -i:6633 to get pid and kill with sudo kill -9 "pid"
+- If the controller don't get incoming packets, it might be due to already installed flow rules: clean them with the del-flows command
+- If "Waiting for the host's local ARP cache to reset" does not disappear: clear the hosts local arp table
