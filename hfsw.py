@@ -13,13 +13,9 @@ from collections import defaultdict
 import random
 import paramiko
 
-links = []
-limited_links = []
-switch_list = []
-links_list = []
-running_policies = []
-running_flows = []
 sleeptime = 10
+real_time_limit = 2
+links, limited_links,switch_list, links_list, running_policies, running_flows, real_time_pool = [],[],[],[],[],[], []
 port_status = defaultdict(lambda:defaultdict(lambda:None))
 old_src_rxtx_bytes = defaultdict(lambda:defaultdict(lambda:None))
 old_dst_rxtx_bytes = defaultdict(lambda:defaultdict(lambda:None))
@@ -98,18 +94,6 @@ class HFsw(app_manager.RyuApp):
                             #Installs flows using queue 1 and saves the flows
                             self.flow_rule_crawler_install(low_paths[-1][1], True, 1)
 
-                    #Forwards the ARP response after path is created
-                    #for running in running_policies:
-                     #    if running[0][-1] == dst and dropped[src][dst] is None:
-                      #      for node in switch_list:
-                       #         if running[0][-2] == node.dp.id:
-                        #            port = self.net[running[0][-2]][dst]['port']
-                        #            actions = [ofp_parser.OFPActionOutput(port=port)]
-                        #            out = ofp_parser.OFPPacketOut(datapath=node.dp, buffer_id=0xffffffff, in_port=in_port, actions=actions, data=msg.data)
-                        #            node.dp.send_msg(out)
-                        #            print "ARP reply forwarded on sw:", node.dp.id, " out port: ", port
-                        #            break
-
                 except nx.NetworkXNoPath:
                     print "Could not create flow path"
             else:
@@ -167,7 +151,7 @@ class HFsw(app_manager.RyuApp):
         #Generating random link speeds, for simulation purposes
         hub.sleep(0.1)
         for link in links_list:
-            linkspeed = random.randint(10,20)
+            linkspeed = random.randint(3,4)
             if link_bandwidths[link.src.dpid][link.src.port_no] is None and link_bandwidths[link.dst.dpid][link.dst.port_no] is None:
                 link_bandwidths[link.src.dpid][link.src.port_no] = linkspeed
                 link_bandwidths[link.dst.dpid][link.dst.port_no] = linkspeed
@@ -246,6 +230,8 @@ class HFsw(app_manager.RyuApp):
             if (running[0][0] == ev.msg.match['eth_src'] and running[0][-1] == ev.msg.match['eth_dst']):
                 print "Flow with policy timed out"
                 bw = self.policy_action_fetcher(running[1], "bandwidth_requirement")
+                if bw is None:
+                    bw = real_time_limit
                 self.update_path_bandwidth(running[0], bw, False)
                 remove.append(index)
             index = index+1
@@ -278,6 +264,7 @@ class HFsw(app_manager.RyuApp):
         #bandwidth_requirement = 0
 
         bw_req = False
+        real_time_req = False
         for match in policy_match:
             block = self.policy_action_fetcher(match, "block")
             if block is True:
@@ -285,19 +272,37 @@ class HFsw(app_manager.RyuApp):
                 for p in possible_paths:
                     self.send_flow_rule_drop(p[0], p[-1], p[1])
                     self.send_flow_rule_drop(p[-1], p[-0], p[-2])
-
                     return
+
+            if real_time_req is False:
+                real_time = self.policy_action_fetcher(match, "real-time")
+                if real_time is not None:
+                    rt_links = self.real_time_pool()
+                    rt_policy = match
+                    real_time_req = True
+                    for rt in rt_links:
+                        try:
+                            self.net.remove_edge(rt.src.dpid, rt.dst.dpid)
+                            self.net.remove_edge(rt.dst.dpid, rt.src.dpid)
+                        except nx.NetworkXError:
+                            "Link already removed"
 
             if bw_req is False:
                 bw = self.policy_action_fetcher(match, "bandwidth_requirement")
-                if bw != 0:
+                if bw is not None:
                     bw_policy = match
                     bw_req = True
 
-        if bw != 0:
-            bandwidth_requirement = self.bandwidth_checker(src, dst, bw_policy)
 
-            #If one path is found
+        if bw_req is True or real_time_req is True:
+
+            if bw_req is True:
+                bandwidth_requirement = self.bandwidth_checker(src, dst, bw_policy)
+            else:
+                bandwidth_requirement = self.bandwidth_checker(src, dst, rt_policy)
+                bw_policy = rt_policy
+
+            #If a single path is found
             if len(bandwidth_requirement) is 3:
                 traffic_class = 0
                 random_routing = False
@@ -306,7 +311,7 @@ class HFsw(app_manager.RyuApp):
                         random_routing = self.policy_action_fetcher(match, "random_routing")
                     if traffic_class is 0:
                         traffic_class = self.policy_action_fetcher(match, "traffic_class")
-                        if traffic_class != 0:
+                        if traffic_class is not None:
                             #Finds the best paths within the approved paths
                             weighted_paths = self.calculate_traffic_class(bandwidth_requirement[0], traffic_class)
 
@@ -495,9 +500,16 @@ class HFsw(app_manager.RyuApp):
                     self.logger.info("Packet %s to %s",src, dst)
                     dropped[src][dst] = True
 
-
         else:
             print "No bandwidth requirements"
+
+        if real_time is not None:
+            for rt in rt_links:
+                try:
+                    self.net.add_edge(rt.src.dpid, rt.dst.dpid)
+                    self.net.add_edge(rt.dst.dpid, rt.src.dpid)
+                except nx.NetworkXError:
+                    "Link already added"
 
 
     def _send_packet(self, datapath, port, pkt):
@@ -526,48 +538,39 @@ class HFsw(app_manager.RyuApp):
             for key, value in action.iteritems():
                 if value != 0 or value is True:
 
-                    if key == "bandwidth_requirement":
-                        print "Policy_action", key, value
-                        traffic_load_bol = True
+                    if key == "real-time":
+                        value = real_time_limit
 
-                        #Gets the possible paths in the network
-                        possible_paths = nx.all_shortest_paths(self.net, src, dst)
+                    print "Policy_action", key, value
+                    traffic_load_bol = True
 
-                        # Filters out the bad links
-                        bad_links = self.check_path_bandwidth(possible_paths, value)
+                    #Gets the possible paths in the network
+                    possible_paths = nx.all_shortest_paths(self.net, src, dst)
 
-                        for l in bad_links:
-                            try:
-                                self.net.remove_edge(l.src.dpid, l.dst.dpid)
-                                self.net.remove_edge(l.dst.dpid, l.src.dpid)
-                            except nx.NetworkXError:
-                                print "Link is already deleted"
+                    # Filters out the bad links
+                    bad_links = self.check_path_bandwidth(possible_paths, value)
 
-                        #Tries to find a path among the filtred links
-                        if nx.has_path(self.net, src, dst):
+                    for l in bad_links:
+                        try:
+                            self.net.remove_edge(l.src.dpid, l.dst.dpid)
+                            self.net.remove_edge(l.dst.dpid, l.src.dpid)
+                        except nx.NetworkXError:
+                            print "Link is already deleted"
 
-                            #If a path is available, take the shortest path.
-                            possible_paths = nx.all_shortest_paths(self.net,src,dst)
-                            print "Found a path which matches requirements"
+                    #Tries to find a path among the filtred links
+                    if nx.has_path(self.net, src, dst):
 
-                            for path in possible_paths:
-                                single_path.append(path)
+                        #If a path is available, take the shortest path.
+                        possible_paths = nx.all_shortest_paths(self.net,src,dst)
+                        print "Found a path which matches requirements"
 
-                            #Skip traffic loading,due to a path is found
-                            traffic_load_bol = False
+                        for path in possible_paths:
+                            single_path.append(path)
 
-                            #Adds the bad links back in top routing pool
-                            for l in bad_links:
-                                try:
-                                    self.net.add_edge(l.src.dpid, l.dst.dpid)
-                                    self.net.add_edge(l.dst.dpid, l.src.dpid)
-                                except nx.NetworkXError:
-                                    print "Link is already added"
+                        #Skip traffic loading,due to a path is found
+                        traffic_load_bol = False
 
-                            #Install flow rules
-                            return [single_path, policy, value]
-
-                            #Adds the bad links back in top routing pool
+                        #Adds the bad links back in top routing pool
                         for l in bad_links:
                             try:
                                 self.net.add_edge(l.src.dpid, l.dst.dpid)
@@ -575,47 +578,58 @@ class HFsw(app_manager.RyuApp):
                             except nx.NetworkXError:
                                 print "Link is already added"
 
-                        if traffic_load_bol:
-                            #If no paths is found
-                            print "Trying traffic loading"
-                            traffic_load_paths = []
-                            traffic_load_limit = value
+                        #Install flow rules
+                        return [single_path, policy, value]
 
-                            #Find all possible physical paths
-                            possible_paths = nx.all_shortest_paths(self.net, src, dst)
+                        #Adds the bad links back in top routing pool
+                    for l in bad_links:
+                        try:
+                            self.net.add_edge(l.src.dpid, l.dst.dpid)
+                            self.net.add_edge(l.dst.dpid, l.src.dpid)
+                        except nx.NetworkXError:
+                            print "Link is already added"
 
-                            for p in possible_paths:
-                                link_bandwidth = 999
-                                #Iterate through path to find the weakest link
-                                for nodes in range(len(p)-1):
-                                    #If a link in the path is weak, fetch the weakest link.
-                                    for link in limited_links:
-                                        if p[nodes] == link[1].src.dpid and p[nodes+1] == link[1].dst.dpid:
-                                            if link_bandwidth > link[0]:
-                                                link_bandwidth = link[0]
-                                        elif p[nodes] == link[1].dst.dpid and p[nodes+1] == link[1].src.dpid:
-                                            if link_bandwidth > link[0]:
-                                                link_bandwidth = link[0]
+                    if traffic_load_bol:
+                        #If no paths is found
+                        print "Trying traffic loading"
+                        traffic_load_paths = []
+                        traffic_load_limit = value
 
-                                #Appends the path to a traffic_load_path
-                                traffic_load_paths.append([p,link_bandwidth, value, policy])
+                        #Find all possible physical paths
+                        possible_paths = nx.all_shortest_paths(self.net, src, dst)
 
-                                for nodez in range(len(p)-1):
-                                    for chosen in limited_links:
-                                        if p[nodez] == chosen[1].src.dpid and p[nodez+1] == chosen[1].dst.dpid:
-                                            chosen[0] = chosen[0]-link_bandwidth
-                                traffic_load_limit = traffic_load_limit - link_bandwidth
+                        for p in possible_paths:
+                            link_bandwidth = 999
+                            #Iterate through path to find the weakest link
+                            for nodes in range(len(p)-1):
+                                #If a link in the path is weak, fetch the weakest link.
+                                for link in limited_links:
+                                    if p[nodes] == link[1].src.dpid and p[nodes+1] == link[1].dst.dpid:
+                                        if link_bandwidth > link[0]:
+                                            link_bandwidth = link[0]
+                                    elif p[nodes] == link[1].dst.dpid and p[nodes+1] == link[1].src.dpid:
+                                        if link_bandwidth > link[0]:
+                                            link_bandwidth = link[0]
 
-                                #Only use traffic load to split the traffic using two paths
-                                if traffic_load_limit <= 0 and len(traffic_load_paths) <= 2:
-                                    for p in traffic_load_paths:
-                                        print "Bandwidth limit achieved, using ", p
+                            #Appends the path to a traffic_load_path
+                            traffic_load_paths.append([p,link_bandwidth, value, policy])
 
-                                    #Returns the list of the possible paths!
-                                    return traffic_load_paths
+                            for nodez in range(len(p)-1):
+                                for chosen in limited_links:
+                                    if p[nodez] == chosen[1].src.dpid and p[nodez+1] == chosen[1].dst.dpid:
+                                        chosen[0] = chosen[0]-link_bandwidth
+                            traffic_load_limit = traffic_load_limit - link_bandwidth
 
-                            if value > 0 or len(traffic_load_paths) > 2:
-                                return [policy]
+                            #Only use traffic load to split the traffic using two paths
+                            if traffic_load_limit <= 0 and len(traffic_load_paths) <= 2:
+                                for p in traffic_load_paths:
+                                    print "Bandwidth limit achieved, using ", p
+
+                                #Returns the list of the possible paths!
+                                return traffic_load_paths
+
+                        if value > 0 or len(traffic_load_paths) > 2:
+                            return [policy]
 
 
 
@@ -633,6 +647,24 @@ class HFsw(app_manager.RyuApp):
 
         except IndexError:
             return 0
+
+
+    #Generates a virtual network for real time traffic. Filters out any links less than 2 mbit
+    def real_time_pool(self):
+        if len(real_time_pool)== 0:
+            for link in links_list:
+                #Removes any link with capcacity two
+                if link_bandwidths_original[link.src.dpid][link.src.port_no] <= real_time_limit:
+                    real_time_pool.append(link)
+
+            return real_time_pool
+
+        else:
+            return real_time_pool
+
+
+
+
 
 
     def policy_deleter(self, lower_policy):
@@ -759,8 +791,8 @@ class HFsw(app_manager.RyuApp):
             edge = 1
 
         if traffic_class == 1:
-            print "Traffic class 1: ", sorted(weighted_paths)[:int(edge)]
-            return sorted(weighted_paths)[:int(edge)]
+            print "Traffic class 1: ", sorted(weighted_paths)[int(edge):]
+            return sorted(weighted_paths)[int(edge):]
 
         elif traffic_class == 2:
             print "Traffic class 2: ", sorted(weighted_paths)[:int(edge):]
@@ -921,8 +953,8 @@ class HFsw(app_manager.RyuApp):
         hub.sleep(2)
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect('129.241.209.173', username='mininet', password='mininet')
-        #ssh.connect('192.168.1.33', username='mininet', password='mininet')
+        #ssh.connect('129.241.209.173', username='mininet', password='mininet')
+        ssh.connect('192.168.1.33', username='mininet', password='mininet')
         #ssh.connect('192.168.38.112', username='mininet', password='mininet')
 
         for switch in switch_list:
