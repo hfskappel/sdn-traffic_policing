@@ -62,7 +62,7 @@ class HFsw(app_manager.RyuApp):
             self.net.add_node(src) # Add a node to the graph
             self.net.add_edge(src,dpid) # Add a link from the node to it's edge switch
             self.net.add_edge(dpid,src,{'port':in_port})  # Add link from switch to node and make sure you are identifying the output port.
-            print "Node added to grap, Src:", src, " connected to Sw:", dpid, " on port: ",in_port
+            print "Node added to graph, Src:", src, " connected to Sw:", dpid, " on port: ",in_port
 
         if dst in self.net:
             if nx.has_path(self.net, src, dst):
@@ -73,10 +73,11 @@ class HFsw(app_manager.RyuApp):
                     #If an attatched policy is found.
                     if len(policy_match) is not 0:
                         self.packet_handler(src, dst, policy_match)
+
                     else:
                         for running in running_policies:
                             if (running[0][0] == src and running[0][-1] == dst) or (running[0][0] == dst and running[0][-1] == src):
-                                print "An excisting flow policy is applied for oposite direction of the flow."
+                                print "An existing flow policy is applied for opposite direction of the flow."
                                 path = nx.shortest_path(self.net,src,dst)
                                 self.flow_rule_crawler_install(path,True, 0)
                                 return
@@ -151,7 +152,7 @@ class HFsw(app_manager.RyuApp):
         #Generating random link speeds, for simulation purposes
         hub.sleep(0.1)
         for link in links_list:
-            linkspeed = random.randint(3,4)
+            linkspeed = random.randint(3,3)
             if link_bandwidths[link.src.dpid][link.src.port_no] is None and link_bandwidths[link.dst.dpid][link.dst.port_no] is None:
                 link_bandwidths[link.src.dpid][link.src.port_no] = linkspeed
                 link_bandwidths[link.dst.dpid][link.dst.port_no] = linkspeed
@@ -173,7 +174,7 @@ class HFsw(app_manager.RyuApp):
             print "Link capacity detected: ", link, " speed = ", link_bandwidths[link.src.dpid][link.src.port_no]
 
         else:
-            linkspeed = random.randint(10,20)
+            linkspeed = random.randint(3,3)
             link_bandwidths[link.src.dpid][link.src.port_no] = linkspeed
             link_bandwidths_original[link.src.dpid][link.src.port_no] = linkspeed
             print "Link capacity detected: ", link, " speed = ", linkspeed
@@ -227,11 +228,9 @@ class HFsw(app_manager.RyuApp):
         index = 0
         remove = []
         for running in running_policies:
-            if (running[0][0] == ev.msg.match['eth_src'] and running[0][-1] == ev.msg.match['eth_dst']):
+            if running[0][0] == ev.msg.match['eth_src'] and running[0][-1] == ev.msg.match['eth_dst'] and ev.msg.datapath.id in running[0][2:-2]:
                 print "Flow with policy timed out"
                 bw = self.policy_action_fetcher(running[1], "bandwidth_requirement")
-                if bw is None:
-                    bw = real_time_limit
                 self.update_path_bandwidth(running[0], bw, False)
                 remove.append(index)
             index = index+1
@@ -263,8 +262,12 @@ class HFsw(app_manager.RyuApp):
         #bandwidth_requirement = [policy] (no path found)
         #bandwidth_requirement = 0
 
+        for running in running_policies:
+            if running[0][0] == src and running[0][-1] == dst:
+                print "Policy already added"
+                return
+
         bw_req = False
-        real_time_req = False
         for match in policy_match:
             block = self.policy_action_fetcher(match, "block")
             if block is True:
@@ -274,33 +277,33 @@ class HFsw(app_manager.RyuApp):
                     self.send_flow_rule_drop(p[-1], p[-0], p[-2])
                     return
 
-            if real_time_req is False:
-                real_time = self.policy_action_fetcher(match, "real-time")
-                if real_time is not None:
-                    rt_links = self.real_time_pool()
-                    rt_policy = match
-                    real_time_req = True
-                    for rt in rt_links:
-                        try:
-                            self.net.remove_edge(rt.src.dpid, rt.dst.dpid)
-                            self.net.remove_edge(rt.dst.dpid, rt.src.dpid)
-                        except nx.NetworkXError:
-                            "Link already removed"
-
             if bw_req is False:
                 bw = self.policy_action_fetcher(match, "bandwidth_requirement")
                 if bw is not None:
                     bw_policy = match
                     bw_req = True
+                    real_time = self.policy_action_fetcher(match, "real-time")
+                    if real_time is not None:
+                        rt_links = self.real_time_pool()
+                        for rt in rt_links:
+                            try:
+                                self.net.remove_edge(rt.src.dpid, rt.dst.dpid)
+                                self.net.remove_edge(rt.dst.dpid, rt.src.dpid)
+                            except nx.NetworkXError:
+                                "Link already removed"
 
+        if bw_req is True:
 
-        if bw_req is True or real_time_req is True:
+            bandwidth_requirement = self.bandwidth_checker(src, dst, bw_policy)
 
-            if bw_req is True:
-                bandwidth_requirement = self.bandwidth_checker(src, dst, bw_policy)
-            else:
-                bandwidth_requirement = self.bandwidth_checker(src, dst, rt_policy)
-                bw_policy = rt_policy
+            if real_time is not None:
+                for rt in rt_links:
+                    try:
+                        self.net.add_edge(rt.src.dpid, rt.dst.dpid)
+                        self.net.add_edge(rt.dst.dpid, rt.src.dpid)
+                    except nx.NetworkXError:
+                        "Link already added"
+
 
             #If a single path is found
             if len(bandwidth_requirement) is 3:
@@ -372,14 +375,18 @@ class HFsw(app_manager.RyuApp):
 
                                                     #Update the link bandwidth
                                                     self.update_path_bandwidth(first[0],first[1], True)
-                                                    running_policies.append([first[0], first[3]])
+                                                    splitted_policy1 = policy_manager.Policy()
+                                                    splitted_policy1.action(bandwidth_requirement=first[1])
+                                                    running_policies.append([first[0], splitted_policy1])
 
                                             port2 = self.find_out_port(first[0][f], second[0][s+1])
 
                                             weight = 100-weight
                                             group_rule.append([port2, weight])
                                             self.update_path_bandwidth(second[0],rest, True)
-                                            running_policies.append([second[0], second[3]])
+                                            splitted_policy2 = policy_manager.Policy()
+                                            splitted_policy2.action(bandwidth_requirement=rest)
+                                            running_policies.append([second[0], splitted_policy2])
 
                                 #If ports has been appended, a group rule must be created
                                 if len(group_rule) > 0:
@@ -410,19 +417,21 @@ class HFsw(app_manager.RyuApp):
                                     elif first[0][f+1] == first[0][-1]:
                                         port = self.net[first[0][f]][first[0][f+1]]['port']
                                         self.send_flow_rule_install(src, dst, port, first[0][f], "port", None)
-                    return
+                        return
+                print "Traffic loading is not allowed by policy"
+
 
             #If no possible paths are found with traffic loading; continue to inspect the flowing traffic
             else:
                 #running_policies = [path, policy]
-                print "No available link capacity! Using moving average to get picture of the flowing traffic."
+                print "Using moving average to get picture of the flowing traffic."
                 possible_paths = nx.all_shortest_paths(self.net, src, dst)
                 ma_path = []
 
                 non_strict = False
                 for match in policy_match:
                     non_strict = self.policy_action_fetcher(match, "bandwidth_requirement_strict")
-                    if non_strict == True:
+                    if non_strict is True:
                         #If the policy is non-strict, try to add it to queue 1.
                         for p in possible_paths:
                             flow_count = 0
@@ -473,13 +482,16 @@ class HFsw(app_manager.RyuApp):
                                 break
                         else:
                             non_strict = False
+                        break
 
-                    break
+                    else:
+                        print "The policy is strict, adding it to a path is not allowed."
+                        non_strict = False
 
                 #If the policy is strict, it is not allowed to be added in non-qos queue.
                 if non_strict is False:
                     #lower_policies = priority and path
-                    print "No available link capacity! Trying to delete lower policies."
+                    print "Trying to delete lower policies in order to make room for new policy."
                     possible_paths = nx.all_shortest_paths(self.net, src, dst)
 
                     #For every policy, check if there are lower policies using the same path
@@ -501,15 +513,7 @@ class HFsw(app_manager.RyuApp):
                     dropped[src][dst] = True
 
         else:
-            print "No bandwidth requirements"
-
-        if real_time is not None:
-            for rt in rt_links:
-                try:
-                    self.net.add_edge(rt.src.dpid, rt.dst.dpid)
-                    self.net.add_edge(rt.dst.dpid, rt.src.dpid)
-                except nx.NetworkXError:
-                    "Link already added"
+            print "Policy contains no bandwidth requirements. Please update it to minimum 1!"
 
 
     def _send_packet(self, datapath, port, pkt):
@@ -533,103 +537,103 @@ class HFsw(app_manager.RyuApp):
         single_path = []
         actions = [policy.get_actions()]
         single_path = []
-
+        bw_limit = 0
         for action in actions:
             for key, value in action.iteritems():
                 if value != 0 or value is True:
+                    if key == "bandwidth_requirement":
+                        bw_limit = value
 
-                    if key == "real-time":
-                        value = real_time_limit
+        #print "Policy_action", key, value
+        traffic_load_bol = True
 
-                    print "Policy_action", key, value
-                    traffic_load_bol = True
+        #Gets the possible paths in the network
+        possible_paths = nx.all_shortest_paths(self.net, src, dst)
 
-                    #Gets the possible paths in the network
-                    possible_paths = nx.all_shortest_paths(self.net, src, dst)
+        # Filters out the bad links
+        bad_links = self.check_path_bandwidth(possible_paths, bw_limit)
 
-                    # Filters out the bad links
-                    bad_links = self.check_path_bandwidth(possible_paths, value)
+        for l in bad_links:
+            try:
+                self.net.remove_edge(l.src.dpid, l.dst.dpid)
+                self.net.remove_edge(l.dst.dpid, l.src.dpid)
+            except nx.NetworkXError:
+                print "Link is already deleted"
 
-                    for l in bad_links:
-                        try:
-                            self.net.remove_edge(l.src.dpid, l.dst.dpid)
-                            self.net.remove_edge(l.dst.dpid, l.src.dpid)
-                        except nx.NetworkXError:
-                            print "Link is already deleted"
+        #Tries to find a path among the filtred links
+        if nx.has_path(self.net, src, dst):
 
-                    #Tries to find a path among the filtred links
-                    if nx.has_path(self.net, src, dst):
+            #If a path is available, take the shortest path.
+            possible_paths = nx.all_shortest_paths(self.net,src,dst)
+            print "Found a path which matches requirements"
 
-                        #If a path is available, take the shortest path.
-                        possible_paths = nx.all_shortest_paths(self.net,src,dst)
-                        print "Found a path which matches requirements"
+            for path in possible_paths:
+                single_path.append(path)
 
-                        for path in possible_paths:
-                            single_path.append(path)
+            #Skip traffic loading,due to a path is found
+            traffic_load_bol = False
 
-                        #Skip traffic loading,due to a path is found
-                        traffic_load_bol = False
+            #Adds the bad links back in top routing pool
+            for l in bad_links:
+                try:
+                    self.net.add_edge(l.src.dpid, l.dst.dpid)
+                    self.net.add_edge(l.dst.dpid, l.src.dpid)
+                except nx.NetworkXError:
+                    print "Link is already added"
 
-                        #Adds the bad links back in top routing pool
-                        for l in bad_links:
-                            try:
-                                self.net.add_edge(l.src.dpid, l.dst.dpid)
-                                self.net.add_edge(l.dst.dpid, l.src.dpid)
-                            except nx.NetworkXError:
-                                print "Link is already added"
+            #Install flow rules
+            return [single_path, policy, bw_limit]
 
-                        #Install flow rules
-                        return [single_path, policy, value]
+            #Adds the bad links back in top routing pool
+        for l in bad_links:
+            try:
+                self.net.add_edge(l.src.dpid, l.dst.dpid)
+                self.net.add_edge(l.dst.dpid, l.src.dpid)
+            except nx.NetworkXError:
+                print "Link is already added"
 
-                        #Adds the bad links back in top routing pool
-                    for l in bad_links:
-                        try:
-                            self.net.add_edge(l.src.dpid, l.dst.dpid)
-                            self.net.add_edge(l.dst.dpid, l.src.dpid)
-                        except nx.NetworkXError:
-                            print "Link is already added"
+        if traffic_load_bol:
+            #If no paths is found
+            print "Checking if traffic loading is possible"
+            traffic_load_paths = []
+            traffic_load_limit = bw_limit
 
-                    if traffic_load_bol:
-                        #If no paths is found
-                        print "Trying traffic loading"
-                        traffic_load_paths = []
-                        traffic_load_limit = value
+            #Find all possible physical paths
+            possible_paths = nx.all_shortest_paths(self.net, src, dst)
 
-                        #Find all possible physical paths
-                        possible_paths = nx.all_shortest_paths(self.net, src, dst)
+            for p in possible_paths:
+                link_bandwidth = 999
+                #Iterate through path to find the weakest link
+                for nodes in range(len(p)-1):
+                    #If a link in the path is weak, fetch the weakest link.
+                    for link in limited_links:
+                        if p[nodes] == link[1].src.dpid and p[nodes+1] == link[1].dst.dpid:
+                            if link_bandwidth > link[0]:
+                                link_bandwidth = link[0]
+                        elif p[nodes] == link[1].dst.dpid and p[nodes+1] == link[1].src.dpid:
+                            if link_bandwidth > link[0]:
+                                link_bandwidth = link[0]
 
-                        for p in possible_paths:
-                            link_bandwidth = 999
-                            #Iterate through path to find the weakest link
-                            for nodes in range(len(p)-1):
-                                #If a link in the path is weak, fetch the weakest link.
-                                for link in limited_links:
-                                    if p[nodes] == link[1].src.dpid and p[nodes+1] == link[1].dst.dpid:
-                                        if link_bandwidth > link[0]:
-                                            link_bandwidth = link[0]
-                                    elif p[nodes] == link[1].dst.dpid and p[nodes+1] == link[1].src.dpid:
-                                        if link_bandwidth > link[0]:
-                                            link_bandwidth = link[0]
+                #Appends the path to a traffic_load_path
+                traffic_load_paths.append([p,link_bandwidth, bw_limit, policy])
 
-                            #Appends the path to a traffic_load_path
-                            traffic_load_paths.append([p,link_bandwidth, value, policy])
+                for nodez in range(len(p)-1):
+                    for chosen in limited_links:
+                        if p[nodez] == chosen[1].src.dpid and p[nodez+1] == chosen[1].dst.dpid:
+                            chosen[0] = chosen[0]-link_bandwidth
+                traffic_load_limit = traffic_load_limit - link_bandwidth
 
-                            for nodez in range(len(p)-1):
-                                for chosen in limited_links:
-                                    if p[nodez] == chosen[1].src.dpid and p[nodez+1] == chosen[1].dst.dpid:
-                                        chosen[0] = chosen[0]-link_bandwidth
-                            traffic_load_limit = traffic_load_limit - link_bandwidth
+                #Only use traffic load to split the traffic using two paths
+                if traffic_load_limit <= 0 and len(traffic_load_paths) <= 2:
+                    for p in traffic_load_paths:
+                        print "Traffic loading is possible by using ", p
 
-                            #Only use traffic load to split the traffic using two paths
-                            if traffic_load_limit <= 0 and len(traffic_load_paths) <= 2:
-                                for p in traffic_load_paths:
-                                    print "Bandwidth limit achieved, using ", p
+                    #Returns the list of the possible paths!
+                    return traffic_load_paths
 
-                                #Returns the list of the possible paths!
-                                return traffic_load_paths
-
-                        if value > 0 or len(traffic_load_paths) > 2:
-                            return [policy]
+            if bw_limit > 0 or len(traffic_load_paths) > 2:
+                print "Traffic loading is not possible."
+                return [policy]
 
 
 
@@ -648,7 +652,6 @@ class HFsw(app_manager.RyuApp):
         except IndexError:
             return 0
 
-
     #Generates a virtual network for real time traffic. Filters out any links less than 2 mbit
     def real_time_pool(self):
         if len(real_time_pool)== 0:
@@ -661,8 +664,6 @@ class HFsw(app_manager.RyuApp):
 
         else:
             return real_time_pool
-
-
 
 
 
@@ -690,28 +691,28 @@ class HFsw(app_manager.RyuApp):
                             self.flow_rule_crawler_delete(lower_policy[0], False)
 
                             #Update the link bandwidths:
-                            for node in range(len(lower_policy[0])-1):
-                                if lower_policy[0][node] != lower_policy[0][0] and lower_policy[0][node+1] != lower_policy[0][-1]:
+                            #for node in range(len(lower_policy[0])-1):
+                            #    if lower_policy[0][node] != lower_policy[0][0] and lower_policy[0][node+1] != lower_policy[0][-1]:
 
                                     #Update path bandwidth in both directions
-                                    try:
-                                        port1 = self.find_out_port(lower_policy[0][node], lower_policy[0][node+1])
-                                        link_bandwidths[lower_policy[0][node]][port1] = link_bandwidths[lower_policy[0][node]][port1] + value
+                                  #  try:
+                                 #       port1 = self.find_out_port(lower_policy[0][node], lower_policy[0][node+1])
+                                #        link_bandwidths[lower_policy[0][node]][port1] = link_bandwidths[lower_policy[0][node]][port1] + value
 
-                                        port2 = self.find_out_port(lower_policy[0][node+1], lower_policy[0][node])
-                                        link_bandwidths[lower_policy[0][node+1]][port2] = link_bandwidths[lower_policy[0][node+1]][port2] + value
+                                #        port2 = self.find_out_port(lower_policy[0][node+1], lower_policy[0][node])
+                                #        link_bandwidths[lower_policy[0][node+1]][port2] = link_bandwidths[lower_policy[0][node+1]][port2] + value
 
-                                        print "[POLICY DELETER] Link bandwidths updated on link connecting sw:",lower_policy[0][node], " and sw:",lower_policy[0][node+1], " with capasity ", link_bandwidths[lower_policy[0][node]][port1]
-                                        print "[POLICY DELETER] Link bandwidths updated on link connecting sw:",lower_policy[0][node+1], " and sw:",lower_policy[0][node], " with capasity ", link_bandwidths[lower_policy[0][node+1]][port2]
+                                #        print "[POLICY DELETER] Link bandwidths updated on link connecting sw:",lower_policy[0][node], " and sw:",lower_policy[0][node+1], " with capasity ", link_bandwidths[lower_policy[0][node]][port1]
+                               #         print "[POLICY DELETER] Link bandwidths updated on link connecting sw:",lower_policy[0][node+1], " and sw:",lower_policy[0][node], " with capasity ", link_bandwidths[lower_policy[0][node+1]][port2]
 
-                                    except TypeError:
-                                        print "Disconnected link removed "
+                                #    except TypeError:
+                                #        print "Disconnected link removed "
 
-                    try:
-                        for pop in remove:
-                            running_policies.pop(pop)
-                    except IndexError:
-                        self.logger("Iterating error due to remove items from running policies")
+                   # try:
+                   #     for pop in remove:
+                   #         running_policies.pop(pop)
+                   # except IndexError:
+                   #     self.logger("Iterating error due to remove items from running policies")
 
 
     #Checks policy_lists for key value, based on priority. Returns a list of lower policies!
@@ -953,21 +954,23 @@ class HFsw(app_manager.RyuApp):
         hub.sleep(2)
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        #ssh.connect('129.241.209.173', username='mininet', password='mininet')
-        ssh.connect('192.168.1.33', username='mininet', password='mininet')
+        ssh.connect('129.241.209.195', username='mininet', password='mininet')
+        #ssh.connect('192.168.1.33', username='mininet', password='mininet')
         #ssh.connect('192.168.38.112', username='mininet', password='mininet')
-
-        for switch in switch_list:
-            for port in switch.ports:
-                for link in links_list:
-                    if link.src.dpid == switch.dp.id and port.port_no == link.src.port_no:
-                        link_bw = (link_bandwidths[link.src.dpid][link.src.port_no]*1000000)
-                        queuecmd = "sudo ovs-vsctl set port %s qos=@newqos -- --id=@newqos create qos type=linux-htb other-config:max-rate=%s queues:0=@q0,1=@q1 -- " \
-                                   "--id=@q0 create queue other-config:min-rate=%s other-config:max-rate=%s --" \
-                                   "--id=@q1 create queue other-config:max-rate=%s" \
-                                   % (port.name,link_bw, link_bw, link_bw, link_bw)
-                        ssh.exec_command(queuecmd)
-                        print queuecmd
+        try:
+            for switch in switch_list:
+                for port in switch.ports:
+                    for link in links_list:
+                        if link.src.dpid == switch.dp.id and port.port_no == link.src.port_no:
+                            link_bw = (link_bandwidths[link.src.dpid][link.src.port_no]*1000000)
+                            queuecmd = "sudo ovs-vsctl set port %s qos=@newqos -- --id=@newqos create qos type=linux-htb other-config:max-rate=%s queues:0=@q0,1=@q1 -- " \
+                                       "--id=@q0 create queue other-config:min-rate=%s other-config:max-rate=%s --" \
+                                       "--id=@q1 create queue other-config:max-rate=%s" \
+                                       % (port.name,link_bw, link_bw, link_bw, link_bw)
+                            ssh.exec_command(queuecmd)
+                            print queuecmd
+        except RuntimeError:
+            pass
 
     #Iterating function to inspect a given link for packet loss and transmitting traffic
     def check_link(self, link, measure_loss, measure_bandwidth):
@@ -1050,7 +1053,7 @@ class HFsw(app_manager.RyuApp):
 
                 match = node.dp.ofproto_parser.OFPMatch(eth_src=src, eth_dst=dst)
                 inst = [ofp_parser.OFPInstructionActions(ofproto_v1_3.OFPIT_APPLY_ACTIONS, actions)]
-                mod = node.dp.ofproto_parser.OFPFlowMod(datapath=node.dp, match=match, cookie=0, command=ofproto_v1_3.OFPFC_ADD, idle_timeout=30, hard_timeout=320,priority=100, instructions=inst, flags=ofproto_v1_3.OFPFF_SEND_FLOW_REM)
+                mod = node.dp.ofproto_parser.OFPFlowMod(datapath=node.dp, match=match, cookie=0, command=ofproto_v1_3.OFPFC_ADD, idle_timeout=20, hard_timeout=320,priority=100, instructions=inst, flags=ofproto_v1_3.OFPFF_SEND_FLOW_REM)
                 node.dp.send_msg(mod)
 
 
