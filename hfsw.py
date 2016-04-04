@@ -430,7 +430,7 @@ class HFsw(app_manager.RyuApp):
 
                 non_strict = False
                 for match in policy_match:
-                    non_strict = self.policy_action_fetcher(match, "bandwidth_requirement_strict")
+                    non_strict = self.policy_action_fetcher(match, "bandwidth_requirement_nonstrict")
                     if non_strict is True:
                         #If the policy is non-strict, try to add it to queue 1.
                         for p in possible_paths:
@@ -441,7 +441,7 @@ class HFsw(app_manager.RyuApp):
 
                             #Counts the running flows down a specific path
                             for r in running_policies:
-                                if p ==r[0]:
+                                if p[1:-1] ==r[0][1:-1]:
                                     flow_count = flow_count+1
 
                             #Finds average flowing traffic
@@ -459,7 +459,7 @@ class HFsw(app_manager.RyuApp):
                                     average_flow = average_path/flow_count
                                     capacity = full_path - (average_path + average_flow)
 
-                                    print "Average per flow :", average_flow, "Average per path ", average_path, "Full path bandwidth", full_path, "with remaining capacity ", capacity
+                                    print "Average per flow :", average_flow, "Average per path ", average_path, "Full path bandwidth", full_path, "with realistic remaining capacity ", capacity
 
                                     req = self.policy_action_fetcher(bandwidth_requirement[0],"bandwidth_requirement")
 
@@ -475,10 +475,11 @@ class HFsw(app_manager.RyuApp):
                             #Sorts by capacity
                             sorted(ma_path)
                             for ma in ma_path:
-                                print ma
                                 #Installs the flow in queue 1 (non-qos)
                                 self.flow_rule_crawler_install(ma[1], True, 1)
-                                running_policies.append([ma[1], p])
+                                #running_policies.append([ma[1], bandwidth_requirement])
+                                running_flows.append(ma[1])
+                                print "Policy requirements are achieved based on current path traffic. Using the link temporary."
                                 break
                         else:
                             non_strict = False
@@ -509,7 +510,10 @@ class HFsw(app_manager.RyuApp):
                                 return
 
                     print "Policy moving executed, and still no path available!"
-                    self.logger.info("Packet %s to %s",src, dst)
+                    possible_paths = nx.all_shortest_paths(self.net, src, dst)
+                    for p in possible_paths:
+                        self.send_flow_rule_drop(p[0], p[-1], p[1])
+                        self.send_flow_rule_drop(p[-1], p[-0], p[-2])
                     dropped[src][dst] = True
 
         else:
@@ -759,12 +763,15 @@ class HFsw(app_manager.RyuApp):
         running = []
         for r in running_flows:
             for l in range(len(r[0])-1):
-                if r[l] != r[0] and r[l+1]!= r[-1]:
-                    if r[l]==link.src.dpid and r[l+1] == link.dst.dpid:
-                        running.append(r)
+                try:
+                    if r[l] != r[0] and r[l+1]!= r[-1]:
+                        if r[l]==link.src.dpid and r[l+1] == link.dst.dpid:
+                            running.append(r)
 
-                    elif r[l]==link.dst.dpid and r[l+1] == link.src.dpid:
-                        running.append(r)
+                        elif r[l]==link.dst.dpid and r[l+1] == link.src.dpid:
+                            running.append(r)
+                except IndexError:
+                    pass
         return running
 
 
@@ -963,12 +970,17 @@ class HFsw(app_manager.RyuApp):
                     for link in links_list:
                         if link.src.dpid == switch.dp.id and port.port_no == link.src.port_no:
                             link_bw = (link_bandwidths[link.src.dpid][link.src.port_no]*1000000)
-                            queuecmd = "sudo ovs-vsctl set port %s qos=@newqos -- --id=@newqos create qos type=linux-htb other-config:max-rate=%s queues:0=@q0,1=@q1 -- " \
-                                       "--id=@q0 create queue other-config:min-rate=%s other-config:max-rate=%s --" \
-                                       "--id=@q1 create queue other-config:max-rate=%s" \
-                                       % (port.name,link_bw, link_bw, link_bw, link_bw)
+
+                            queuecmd = "sudo ovs-vsctl set port %s qos=@defaultqos -- --id=@defaultqos create qos type=linux-htb other-config:max-rate=%s queues=0=@q0,1=@q1 -- " \
+                                       "--id=@q0 create queue other-config:min-rate=%s -- " \
+                                       "--id=@q1 create queue other-config:min-rate=0"% (port.name,link_bw, link_bw)
+
+                            policecmd = " sudo ovs-vsctl set Interface %s ingress_policing_rate=%s" % (port.name,(link_bw/1000))
+
                             ssh.exec_command(queuecmd)
+                            ssh.exec_command(policecmd)
                             print queuecmd
+                            print policecmd
         except RuntimeError:
             pass
 
@@ -1053,7 +1065,7 @@ class HFsw(app_manager.RyuApp):
 
                 match = node.dp.ofproto_parser.OFPMatch(eth_src=src, eth_dst=dst)
                 inst = [ofp_parser.OFPInstructionActions(ofproto_v1_3.OFPIT_APPLY_ACTIONS, actions)]
-                mod = node.dp.ofproto_parser.OFPFlowMod(datapath=node.dp, match=match, cookie=0, command=ofproto_v1_3.OFPFC_ADD, idle_timeout=20, hard_timeout=320,priority=100, instructions=inst, flags=ofproto_v1_3.OFPFF_SEND_FLOW_REM)
+                mod = node.dp.ofproto_parser.OFPFlowMod(datapath=node.dp, match=match, cookie=0, command=ofproto_v1_3.OFPFC_ADD, idle_timeout=200, hard_timeout=320,priority=100, instructions=inst, flags=ofproto_v1_3.OFPFF_SEND_FLOW_REM)
                 node.dp.send_msg(mod)
 
 
