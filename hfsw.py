@@ -243,36 +243,43 @@ class HFsw(app_manager.RyuApp):
     def _flow_removed(self, ev):
         index = 0
         remove = []
-        for running in running_policies:
-            if running[0][0] == ev.msg.match['eth_src'] and running[0][-1] == ev.msg.match['eth_dst'] and ev.msg.datapath.id in running[0][2:-2]:
-                print "Flow with policy timed out"
-                bw = self.policy_action_fetcher(running[1], "bandwidth_requirement")
-                self.update_path_bandwidth(running[0], bw, False)
-                remove.append(index)
-            index = index+1
+        if ev.msg.duration_sec == ev.msg.hard_timeout:
+           print "Hard Timeout. Randomly re-routing flow"
 
-        if len(remove) > 0:
-            for pop in remove:
-                running_policies.pop(pop)
-                return
+        else: #If idle timeout limit is triggered, the flow is unused and should be removed
+            print running_policies
+            for running in running_policies:
+                if running[0][0] == ev.msg.match['eth_src'] and running[0][-1] == ev.msg.match['eth_dst'] and ev.msg.datapath.id in running[0][1:-1]:
+                    print "Flow with policy timed out"
+                    bw = self.policy_action_fetcher(running[1], "bandwidth_requirement")
+                    self.update_path_bandwidth(running[0], bw, False)
+                    remove.append(index)
+                index = index+1
 
-        index = 0
-        for flow in running_flows:
-            if (flow[0] == ev.msg.match['eth_src'] and flow[-1] == ev.msg.match['eth_dst']):
-                remove.append(index)
-                print "Flow without policy timed out"
-            index = index+1
+            if len(remove) > 0:
+                for pop in remove:
+                    running_policies.pop(pop)
+                    return
 
-        if len(remove) > 0:
-            for pop in remove:
-                running_flows.pop(pop)
-                return
+            index = 0
+            for flow in running_flows:
+                if (flow[0] == ev.msg.match['eth_src'] and flow[-1] == ev.msg.match['eth_dst']):
+                    remove.append(index)
+                    print "Flow without policy timed out"
+                index = index+1
+
+            if len(remove) > 0:
+                for pop in remove:
+                    running_flows.pop(pop)
+                    return
 
 ################ CUSTOM FUNCTIONS ######################################################################################
 
     #Packet handling function
     def packet_handler(self, src, dst, policy_match):
         global link_bandwidths
+        new_path = False
+        old_path = None
         #bandwidth_requirement = [[path,link_bandwidth, value, policy]] (traffic load)
         #bandwidth_requirement = [path, policy, value] (single_path)
         #bandwidth_requirement = [policy] (no path found)
@@ -280,8 +287,9 @@ class HFsw(app_manager.RyuApp):
 
         for running in running_policies:
             if running[0][0] == src and running[0][-1] == dst:
-                print "Policy already added"
-                return
+                print "The flow requires to use a new path"
+                new_path = True
+                old_path = running[0]
 
         bw_req = False
         for match in policy_match:
@@ -334,22 +342,48 @@ class HFsw(app_manager.RyuApp):
                             #Finds the best paths within the approved paths
                             weighted_paths = self.calculate_traffic_class(bandwidth_requirement[0], traffic_class)
 
-                #If random routing and traffic class is applied to flow: choose randomly in the traffic class pool
-                if random_routing is True and traffic_class is not 0:
+                if new_path is True and random_routing is True and traffic_class is not None:
+                    for running in running_policies:
+                        if running[0][0] == src and running[0][-1] == dst:
+                            for path in weighted_paths:
+                                if running[0] == path and len(weighted_paths):
+                                    weighted_paths.pop(weighted_paths.index(path))
+                                    running_policies.pop(running_policies.index(running))
+
                     route = random.randint(0,len(weighted_paths)-1)
                     self.flow_rule_crawler_install(weighted_paths[route][1], True, 0)
                     running_policies.append([weighted_paths[route][1], bandwidth_requirement[1]])
                     self.update_path_bandwidth(weighted_paths[route][1], bandwidth_requirement[2], True)
 
                 #If random routing is applied to flow: choose randomly in the path pool
-                elif random_routing is True and traffic_class is 0:
+                elif new_path is True and random_routing is True and traffic_class is None:
+                    for running in running_policies:
+                        if running[0][0] == src and running[0][-1] == dst:
+                            for path in bandwidth_requirement:
+                                if running[0] == path and len(bandwidth_requirement) >=2:
+                                    bandwidth_requirement.pop(bandwidth_requirement.index(path))
+                                    running_policies.pop(running_policies.index(running))
+
+                    route = random.randint(0,len(bandwidth_requirement[0])-1)
+                    self.flow_rule_crawler_install(bandwidth_requirement[0][route], True, 0)
+                    running_policies.append([bandwidth_requirement[0][route], bandwidth_requirement[1]])
+                    self.update_path_bandwidth(bandwidth_requirement[0][route], bandwidth_requirement[2], True)
+
+                elif random_routing is True and traffic_class is not None:
+                    route = random.randint(0,len(weighted_paths)-1)
+                    self.flow_rule_crawler_install(weighted_paths[route][1], True, 0)
+                    running_policies.append([weighted_paths[route][1], bandwidth_requirement[1]])
+                    self.update_path_bandwidth(weighted_paths[route][1], bandwidth_requirement[2], True)
+
+                #If random routing is applied to flow: choose randomly in the path pool
+                elif random_routing is True and traffic_class is None:
                     route = random.randint(0,len(bandwidth_requirement[0])-1)
                     self.flow_rule_crawler_install(bandwidth_requirement[0][route], True, 0)
                     running_policies.append([bandwidth_requirement[0][route], bandwidth_requirement[1]])
                     self.update_path_bandwidth(bandwidth_requirement[0][route], bandwidth_requirement[2], True)
 
                 #If traffic class is applied to flow, but no randomess, choose the best path.
-                elif traffic_class is not None and random_routing is not True:
+                elif random_routing is not True and traffic_class is not None:
                     self.flow_rule_crawler_install(weighted_paths[0][1], True, 0)
                     running_policies.append([weighted_paths[0][1], bandwidth_requirement[1]])
                     self.update_path_bandwidth(weighted_paths[0][1], bandwidth_requirement[2], True)
@@ -403,7 +437,6 @@ class HFsw(app_manager.RyuApp):
                                             self.update_path_bandwidth(second[0],rest, True)
                                             splitted_policy2 = policy_manager.Policy()
                                             splitted_policy2.priority = bandwidth_requirement[0][3].priority
-                                            print " YOLOOOOL ", bandwidth_requirement[0][3].priority
                                             splitted_policy2.action(bandwidth_requirement=rest)
                                             running_policies.append([second[0], splitted_policy2])
 
@@ -529,12 +562,17 @@ class HFsw(app_manager.RyuApp):
                                 print "Ending iteration, found a path after removing policy"
                                 return
 
-                    print "Policy moving executed, and still no path available!"
-                    possible_paths = nx.all_simple_paths(self.net, src, dst)
-                    for p in possible_paths:
-                        self.send_flow_rule_drop(p[0], p[-1], p[1])
-                        self.send_flow_rule_drop(p[-1], p[-0], p[-2])
-                    dropped[src][dst] = True
+                    print "Using the same path as before"
+                    if new_path is True:
+                        self.flow_rule_crawler_install(old_path, True, 0)
+
+                    else:
+                        print "Policy moving executed, and still no path available!"
+                        possible_paths = nx.all_simple_paths(self.net, src, dst)
+                        for p in possible_paths:
+                            self.send_flow_rule_drop(p[0], p[-1], p[1])
+                            self.send_flow_rule_drop(p[-1], p[-0], p[-2])
+                        dropped[src][dst] = True
 
         else:
             print "Policy contains no bandwidth requirements. Please update it to minimum 1!"
@@ -764,8 +802,6 @@ class HFsw(app_manager.RyuApp):
 
         for l in sorted(lower_policies,reverse=True):
             sorted_lower_policies.append(l[1])
-
-        print "SORTED POLICIES BY PRI ", sorted_lower_policies
         return sorted_lower_policies
 
 
@@ -1104,7 +1140,7 @@ class HFsw(app_manager.RyuApp):
 
                 match = node.dp.ofproto_parser.OFPMatch(eth_src=src, eth_dst=dst)
                 inst = [ofp_parser.OFPInstructionActions(ofproto_v1_3.OFPIT_APPLY_ACTIONS, actions)]
-                mod = node.dp.ofproto_parser.OFPFlowMod(datapath=node.dp, match=match, cookie=0, command=ofproto_v1_3.OFPFC_ADD, idle_timeout=20, hard_timeout=320,priority=100, instructions=inst, flags=ofproto_v1_3.OFPFF_SEND_FLOW_REM)
+                mod = node.dp.ofproto_parser.OFPFlowMod(datapath=node.dp, match=match, cookie=0, command=ofproto_v1_3.OFPFC_ADD, idle_timeout=10, hard_timeout=20,priority=100, instructions=inst, flags=ofproto_v1_3.OFPFF_SEND_FLOW_REM)
                 node.dp.send_msg(mod)
 
 
